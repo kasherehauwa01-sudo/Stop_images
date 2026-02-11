@@ -53,6 +53,72 @@ def make_row_key(product_url: str, src_index: int) -> str:
     return hashlib.sha256(f"{src_index}|{product_url}".encode("utf-8")).hexdigest()
 
 
+def _extract_product_image_candidates(soup: BeautifulSoup, product_url: str) -> List[str]:
+    # Пояснение: собираем кандидаты изображения из мета-тегов, JSON-LD и типовых галерей карточки.
+    candidates: List[str] = []
+
+    for meta_selector in [
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+        "meta[itemprop='image']",
+    ]:
+        node = soup.select_one(meta_selector)
+        if node and node.get("content"):
+            candidates.append(urljoin(product_url, node.get("content", "").strip()))
+
+    for script in soup.select("script[type='application/ld+json']"):
+        text = (script.string or script.get_text() or "").strip()
+        if not text:
+            continue
+        try:
+            import json
+
+            payload = json.loads(text)
+        except Exception:
+            continue
+
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if k == "image":
+                        if isinstance(v, str):
+                            candidates.append(urljoin(product_url, v))
+                        elif isinstance(v, list):
+                            for vv in v:
+                                if isinstance(vv, str):
+                                    candidates.append(urljoin(product_url, vv))
+                    else:
+                        stack.append(v)
+            elif isinstance(item, list):
+                stack.extend(item)
+
+    gallery_selectors = [
+        "img[itemprop='image']",
+        ".product-gallery img",
+        ".product-images img",
+        ".product-card img",
+        "img",
+    ]
+    for selector in gallery_selectors:
+        for img in soup.select(selector):
+            src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+            if not src:
+                continue
+            full = urljoin(product_url, src)
+            candidates.append(full)
+
+    # де-дупликат с сохранением порядка
+    uniq: List[str] = []
+    seen = set()
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
 def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, str]:
     # Пояснение: с карточки товара извлекаем артикул и главное изображение.
     headers = {"User-Agent": "Mozilla/5.0 StopImages/2.0"}
@@ -79,28 +145,12 @@ def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, 
                 if article:
                     break
 
-    image_url = ""
-    og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image and og_image.get("content"):
-        image_url = urljoin(product_url, og_image.get("content", ""))
-
-    if not image_url:
-        best_src = ""
-        best_score = -1
-        for img in soup.find_all("img"):
-            src = (img.get("src") or "").strip()
-            if not src:
-                continue
-            score = int(img.get("width") or 0) * int(img.get("height") or 0)
-            if score > best_score:
-                best_score = score
-                best_src = src
-        if best_src:
-            image_url = urljoin(product_url, best_src)
-
-    if not image_url:
+    image_candidates = _extract_product_image_candidates(soup, product_url)
+    if not image_candidates:
         raise ValueError("Не найдено изображение в карточке товара")
 
+    # Пояснение: отдаем первый релевантный кандидат; при необходимости кэш компенсирует повторы.
+    image_url = image_candidates[0]
     return article, image_url
 
 
@@ -213,6 +263,7 @@ def process_batch(
 
         try:
             article, image_url = extract_article_and_image_from_product_page(product_url)
+            append_log(f"Извлечено изображение: {image_url}")
             image_hash = get_image_hash(image_url)
             cached = storage.get_cached_results(image_hash)
             if cached is None:
@@ -226,6 +277,7 @@ def process_batch(
 
             report_rows = []
             for result in tineye_results:
+                append_log(f"TinEye результат: {result.get('page_url', '')}")
                 matched = classify_stock_url(result.get("page_url", ""), stock_rules)
                 if matched:
                     stock_url, _ = matched
@@ -286,6 +338,7 @@ def check_single_url(
 
     rows: List[Dict[str, str]] = []
     for item in results:
+        append_log(f"TinEye результат: {item.get('page_url', '')}")
         matched = classify_stock_url(item.get("page_url", ""), stock_rules)
         if matched:
             stock_url, _ = matched

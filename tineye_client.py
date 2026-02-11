@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
-from urllib.parse import urljoin, urlparse
+from typing import Dict, List, Optional
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,6 +41,26 @@ class TinEyeScraperClient:
         response.raise_for_status()
         return self._parse_results(response.text, response.url, top_n=top_n)
 
+    def _extract_external_url(self, raw_href: str, final_url: str) -> Optional[str]:
+        if not raw_href:
+            return None
+        abs_url = urljoin(final_url, raw_href.strip())
+        parsed = urlparse(abs_url)
+
+        # Если ссылка уже внешняя — берем ее.
+        if parsed.netloc and "tineye.com" not in parsed.netloc.lower():
+            return abs_url
+
+        # Пояснение: TinEye часто использует редирект/внутренние ссылки с параметром url.
+        query = parse_qs(parsed.query)
+        for key in ("url", "u", "target"):
+            if key in query and query[key]:
+                candidate = unquote(query[key][0])
+                c_parsed = urlparse(candidate)
+                if c_parsed.scheme in {"http", "https"}:
+                    return candidate
+        return None
+
     def _parse_results(self, html: str, final_url: str, top_n: int) -> List[Dict[str, str]]:
         soup = BeautifulSoup(html, "html.parser")
         normalized: List[Dict[str, str]] = []
@@ -53,6 +73,8 @@ class TinEyeScraperClient:
             "section.results a[href]",
             "ul.matches a[href]",
             "a.match-link[href]",
+            "a[href*='shutterstock']",
+            "[data-href]",
         ]
 
         candidates = []
@@ -60,18 +82,21 @@ class TinEyeScraperClient:
             candidates.extend(soup.select(selector))
 
         seen = set()
-        for a in candidates:
-            href = (a.get("href") or "").strip()
-            if not href:
-                continue
-            abs_url = urljoin(final_url, href)
-            if abs_url in seen:
-                continue
-            seen.add(abs_url)
+        for node in candidates:
+            href = ""
+            if node.has_attr("href"):
+                href = (node.get("href") or "").strip()
+            elif node.has_attr("data-href"):
+                href = (node.get("data-href") or "").strip()
 
-            host = urlparse(abs_url).netloc.lower()
-            title = (a.get_text(" ", strip=True) or "")[:500]
-            normalized.append({"page_url": abs_url, "domain": host, "title": title})
+            ext_url = self._extract_external_url(href, final_url)
+            if not ext_url or ext_url in seen:
+                continue
+            seen.add(ext_url)
+
+            host = urlparse(ext_url).netloc.lower()
+            title = (node.get_text(" ", strip=True) or "")[:500]
+            normalized.append({"page_url": ext_url, "domain": host, "title": title})
             if len(normalized) >= top_n:
                 break
 
