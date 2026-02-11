@@ -3,21 +3,23 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, Optional, Tuple
 
-# Пояснение: набор синонимов для гибкого автоматического сопоставления колонок XLS.
+# Пояснение: в текущем сценарии обязательным считаем только URL страницы-источника,
+# где размещено изображение и откуда нужно извлечь артикул товара.
 REQUIRED_FIELDS_SYNONYMS = {
-    "image_code": ["код изображения", "image_code", "code", "id", "артикул", "sku"],
-    "image_url": ["ссылка на изображение", "image_url", "url", "link", "image", "фото"],
-    "product_name": ["наименование товара", "товар", "product", "product_name", "name"],
-    "supplier": ["поставщик", "supplier", "vendor"],
-    "manager": ["менеджер", "manager", "ответственный"],
+    "image_url": [
+        "ссылка",
+        "ссылка на сайт",
+        "ссылка на страницу",
+        "url",
+        "link",
+        "page_url",
+        "product_url",
+        "image_url",
+    ],
 }
 
 FIELD_LABELS = {
-    "image_code": "Код изображения",
-    "image_url": "Ссылка на изображение (URL)",
-    "product_name": "Наименование товара",
-    "supplier": "Поставщик",
-    "manager": "Менеджер",
+    "image_url": "Ссылка на страницу сайта",
 }
 
 
