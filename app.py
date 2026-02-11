@@ -53,6 +53,30 @@ def make_row_key(product_url: str, src_index: int) -> str:
     return hashlib.sha256(f"{src_index}|{product_url}".encode("utf-8")).hexdigest()
 
 
+def download_image_bytes(image_url: str) -> Tuple[bytes, str, str]:
+    # Пояснение: загружаем бинарник изображения для последующей загрузки в веб-интерфейс TinEye.
+    headers = {"User-Agent": "StopImages/2.0"}
+    resp = requests.get(image_url, timeout=TIMEOUT_SECONDS, stream=True, allow_redirects=True, headers=headers)
+    resp.raise_for_status()
+    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    if not content_type.startswith("image/"):
+        raise ValueError(f"Ресурс не image/*: {content_type}")
+
+    chunks = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=1024 * 128):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_FILE_SIZE:
+            raise ValueError("Размер изображения превышает 25 МБ")
+        chunks.append(chunk)
+
+    image_bytes = b"".join(chunks)
+    ext = content_type.split("/")[-1] or "jpg"
+    filename = f"upload_image.{ext}"
+    return image_bytes, filename, content_type
+
 def _extract_product_image_candidates(soup: BeautifulSoup, product_url: str) -> List[str]:
     # Пояснение: собираем кандидаты изображения из мета-тегов, JSON-LD и типовых галерей карточки.
     candidates: List[str] = []
@@ -264,11 +288,17 @@ def process_batch(
         try:
             article, image_url = extract_article_and_image_from_product_page(product_url)
             append_log(f"Извлечено изображение: {image_url}")
-            image_hash = get_image_hash(image_url)
+            image_bytes, filename, mime_type = download_image_bytes(image_url)
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
             cached = storage.get_cached_results(image_hash)
             if cached is None:
-                append_log(f"TinEye запрос для {product_url}")
-                tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
+                append_log(f"TinEye upload-запрос для {product_url}")
+                tineye_results = tineye_client.search_by_upload(
+                    image_bytes=image_bytes,
+                    filename=filename,
+                    mime_type=mime_type,
+                    top_n=DEFAULT_TOP_N,
+                )
                 storage.set_cached_results(image_hash, tineye_results)
                 append_log(f"Кэш сохранен: {image_hash[:12]}")
             else:
@@ -326,11 +356,18 @@ def check_single_url(
         return []
 
     article, image_url = extract_article_and_image_from_product_page(source_url)
-    image_hash = get_image_hash(image_url)
+    append_log(f"Одиночная проверка: извлечено изображение {image_url}")
+    image_bytes, filename, mime_type = download_image_bytes(image_url)
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
     cached = storage.get_cached_results(image_hash)
     if cached is None:
-        append_log(f"TinEye запрос для одиночной проверки: {source_url}")
-        results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
+        append_log(f"TinEye upload-запрос для одиночной проверки: {source_url}")
+        results = tineye_client.search_by_upload(
+            image_bytes=image_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            top_n=DEFAULT_TOP_N,
+        )
         storage.set_cached_results(image_hash, results)
     else:
         append_log(f"Одиночная проверка: использован кэш {image_hash[:12]}")
