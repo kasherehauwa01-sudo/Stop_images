@@ -144,6 +144,27 @@ def scrape_product_links_from_section(section_url: str) -> List[str]:
     return links
 
 
+
+
+def init_logs() -> None:
+    # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки в UI.
+    if "ui_logs" not in st.session_state:
+        st.session_state["ui_logs"] = []
+
+
+def append_log(message: str) -> None:
+    # Пояснение: централизованное добавление строк лога с ограничением размера буфера.
+    logs = st.session_state.get("ui_logs", [])
+    logs.append(message)
+    st.session_state["ui_logs"] = logs[-500:]
+
+
+def render_logs(log_placeholder) -> None:
+    # Пояснение: показываем последние строки лога в отдельном блоке интерфейса.
+    logs = st.session_state.get("ui_logs", [])
+    text = "\n".join(logs[-200:]) if logs else "Логи пока отсутствуют."
+    log_placeholder.code(text, language="text")
+
 def show_help() -> None:
     with st.expander("Как работает механика проверки", expanded=False):
         # Пояснение: объясняем эквивалент механики "Search image on TinEye" в автоматическом режиме.
@@ -166,6 +187,7 @@ def process_batch(
     start_row: int,
     batch_size: int,
     top_n: int,
+    log_placeholder,
 ):
     start_idx = max(1, start_row) - 1
     end_idx = min(len(products), start_idx + batch_size)
@@ -184,17 +206,23 @@ def process_batch(
         product_url = product["product_url"]
         row_key = make_row_key(product_url, src_index)
         batch_keys.append(row_key)
-        status_box.info(f"Обработка карточки {src_index + 1} ({i}/{len(batch)})")
+        status_msg = f"Обработка карточки {src_index + 1} ({i}/{len(batch)})"
+        status_box.info(status_msg)
+        append_log(status_msg)
+        render_logs(log_placeholder)
 
         try:
             article, image_url = extract_article_and_image_from_product_page(product_url)
             image_hash = get_image_hash(image_url)
             cached = storage.get_cached_results(image_hash)
             if cached is None:
+                append_log(f"TinEye запрос для {product_url}")
                 tineye_results = tineye_client.search_by_url(image_url, top_n=top_n)
                 storage.set_cached_results(image_hash, tineye_results)
+                append_log(f"Кэш сохранен: {image_hash[:12]}")
             else:
                 tineye_results = cached
+                append_log(f"Использован кэш: {image_hash[:12]}")
 
             report_rows = []
             for result in tineye_results:
@@ -213,16 +241,21 @@ def process_batch(
             if report_rows:
                 storage.add_report_rows(row_key, report_rows)
                 matched_count += len(report_rows)
+                append_log(f"Найдено совпадений на стоках: {len(report_rows)} | {product_url}")
+            else:
+                append_log(f"Совпадения на стоках не найдены | {product_url}")
             processed_count += 1
 
         except Exception as exc:
             storage.upsert_row_status(row_key, "error", None, 0, str(exc))
+            append_log(f"Ошибка: {product_url} | {exc}")
             error_count += 1
             processed_count += 1
 
-        st.caption(
-            f"Обработано: {processed_count} | В очереди: {len(batch)-processed_count} | Ошибки: {error_count} | Совпадения: {matched_count}"
-        )
+        progress_line = f"Обработано: {processed_count} | В очереди: {len(batch)-processed_count} | Ошибки: {error_count} | Совпадения: {matched_count}"
+        st.caption(progress_line)
+        append_log(progress_line)
+        render_logs(log_placeholder)
         progress.progress(i / max(1, len(batch)))
 
     storage.finish_batch_run(run_id, processed_count, error_count, matched_count)
@@ -239,7 +272,12 @@ def main() -> None:
         TinEyeScraperSettings(base_url=read_secret_or_env("TINEYE_BASE_URL", "https://tineye.com"), timeout_seconds=30)
     )
 
+    init_logs()
     show_help()
+
+    st.subheader("Логи обработки")
+    log_placeholder = st.empty()
+    render_logs(log_placeholder)
 
     input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
     source_df = None
@@ -286,10 +324,16 @@ def main() -> None:
             for section_url in section_urls:
                 try:
                     links = scrape_product_links_from_section(section_url)
-                    st.write(f"{section_url} → найдено карточек: {len(links)}")
+                    line = f"{section_url} → найдено карточек: {len(links)}"
+                    st.write(line)
+                    append_log(line)
+                    render_logs(log_placeholder)
                     products.extend({"product_url": link} for link in links)
                 except Exception as exc:
-                    st.warning(f"Ошибка парсинга раздела {section_url}: {exc}")
+                    warn = f"Ошибка парсинга раздела {section_url}: {exc}"
+                    st.warning(warn)
+                    append_log(warn)
+                    render_logs(log_placeholder)
 
     # Удаляем дубликаты карточек.
     uniq = []
@@ -312,6 +356,9 @@ def main() -> None:
 
     run = st.button("Запустить партию", type="primary", disabled=(len(products) == 0))
     if run:
+        st.session_state["ui_logs"] = []
+        append_log("Старт пакетной обработки")
+        render_logs(log_placeholder)
         report_records, stats = process_batch(
             products=products,
             storage=storage,
@@ -320,6 +367,7 @@ def main() -> None:
             start_row=int(start_row),
             batch_size=int(batch_size),
             top_n=int(top_n),
+            log_placeholder=log_placeholder,
         )
 
         st.success(
