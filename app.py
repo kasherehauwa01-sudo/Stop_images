@@ -236,6 +236,22 @@ def render_tineye_request_url(url_placeholder, url_value: str) -> None:
     else:
         url_placeholder.code(url_value, language="text")
 
+
+
+def set_last_tineye_rows(rows: List[Dict[str, str]]) -> None:
+    # Пояснение: сохраняем последние найденные ссылки TinEye для наглядного показа в UI.
+    st.session_state["last_tineye_rows"] = rows
+
+
+def render_last_tineye_rows() -> None:
+    # Пояснение: отдельный диагностический блок со списком распарсенных ссылок TinEye.
+    rows = st.session_state.get("last_tineye_rows", [])
+    st.subheader("Что удалось распарсить из TinEye URL")
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.caption("Пока нет данных для отображения.")
+
 def init_logs() -> None:
     # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки в UI.
     if "ui_logs" not in st.session_state:
@@ -319,10 +335,12 @@ def process_batch(
                 append_log(f"Использован кэш: {image_hash[:12]}")
 
             report_rows = []
+            parsed_rows_for_ui = []
             for result in tineye_results:
                 result_url = result.get("page_url", "")
                 append_log(f"TinEye результат: {result_url}")
                 if result_url:
+                    parsed_rows_for_ui.append({"Ссылка в результатах TinEye": result_url})
                     report_rows.append(
                         {
                             "Артикул товара": article,
@@ -331,13 +349,14 @@ def process_batch(
                         }
                     )
 
+            set_last_tineye_rows(parsed_rows_for_ui)
             storage.upsert_row_status(row_key, "done", image_hash, len(report_rows), None)
             if report_rows:
                 storage.add_report_rows(row_key, report_rows)
                 matched_count += len(report_rows)
-                append_log(f"Найдено совпадений на стоках: {len(report_rows)} | {product_url}")
+                append_log(f"Найдено результатов TinEye: {len(report_rows)} | {product_url}")
             else:
-                append_log(f"Совпадения на стоках не найдены | {product_url}")
+                append_log(f"Результаты TinEye не найдены | {product_url}")
             processed_count += 1
 
         except Exception as exc:
@@ -384,15 +403,18 @@ def check_single_url(
         results = cached
 
     rows: List[Dict[str, str]] = []
+    parsed_rows_for_ui: List[Dict[str, str]] = []
     for item in results:
         result_url = item.get("page_url", "")
         append_log(f"TinEye результат: {result_url}")
         if result_url:
+            parsed_rows_for_ui.append({"Ссылка в результатах TinEye": result_url})
             rows.append({
                 "Артикул товара": article,
                 "Ссылка на сайт": source_url,
                 "Ссылка в результатах TinEye": result_url,
             })
+    set_last_tineye_rows(parsed_rows_for_ui)
     return rows
 
 
@@ -415,6 +437,8 @@ def main() -> None:
     st.subheader("Сформированный TinEye URL запроса")
     tineye_url_placeholder = st.empty()
     render_tineye_request_url(tineye_url_placeholder, "")
+
+    render_last_tineye_rows()
 
     tab_batch, tab_single = st.tabs(["Пакетная проверка разделов", "Проверка URL"])
 
@@ -500,7 +524,7 @@ def main() -> None:
             try:
                 rows = check_single_url(one_url, storage, tineye_client, tineye_url_placeholder)
                 if rows:
-                    st.success(f"Найдено совпадений на стоках: {len(rows)}")
+                    st.success(f"Найдено результатов TinEye: {len(rows)}")
                     st.dataframe(rows, use_container_width=True)
                     st.download_button(
                         label="Скачать XLSX-отчет по URL",
@@ -510,7 +534,7 @@ def main() -> None:
                         key="download_one",
                     )
                 else:
-                    st.info("Совпадения на стоках не найдены.")
+                    st.info("Результаты TinEye не найдены.")
                 append_log("Одиночная проверка завершена")
                 render_logs(log_placeholder)
             except Exception as exc:

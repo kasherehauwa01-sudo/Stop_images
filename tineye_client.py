@@ -77,6 +77,11 @@ class TinEyeScraperClient:
         for selector in selectors:
             candidates.extend(soup.select(selector))
 
+        # Пояснение: если целевые селекторы ничего не дали,
+        # делаем fallback на все ссылки страницы результатов.
+        if not candidates:
+            candidates = soup.select("a[href], [data-href]")
+
         seen = set()
         for node in candidates:
             href = ""
