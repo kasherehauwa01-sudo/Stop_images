@@ -290,7 +290,8 @@ def process_batch(
             image_hash = hashlib.sha256(image_bytes).hexdigest()
             cached = storage.get_cached_results(image_hash)
             if cached is None:
-                append_log(f"TinEye url-запрос для {product_url}")
+                append_log(f"TinEye url-запрос с извлеченным image_url: {image_url}")
+                # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не URL карточки.
                 tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
                 storage.set_cached_results(image_hash, tineye_results)
                 append_log(f"Кэш сохранен: {image_hash[:12]}")
@@ -352,7 +353,8 @@ def check_single_url(
     image_hash = hashlib.sha256(image_bytes).hexdigest()
     cached = storage.get_cached_results(image_hash)
     if cached is None:
-        append_log(f"TinEye url-запрос для одиночной проверки: {source_url}")
+        append_log(f"TinEye url-запрос для одиночной проверки с image_url: {image_url}")
+        # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не исходный URL страницы.
         results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
         storage.set_cached_results(image_hash, results)
     else:
