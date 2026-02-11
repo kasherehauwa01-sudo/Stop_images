@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Tuple
-from urllib.parse import urljoin
+from typing import Dict, List, Set, Tuple
+from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -22,8 +22,8 @@ TIMEOUT_SECONDS = 20
 
 
 def get_image_hash(image_url: str) -> str:
-    # Пояснение: сначала считаем хэш по бинарному контенту картинки,
-    # если это не удалось — fallback по URL и заголовкам кеширования.
+    # Пояснение: кэшируем по хэшу изображения; fallback на URL+ETag/Last-Modified,
+    # если бинарник недоступен.
     headers = {"User-Agent": "StopImages/2.0"}
     try:
         resp = requests.get(image_url, timeout=TIMEOUT_SECONDS, stream=True, allow_redirects=True, headers=headers)
@@ -44,48 +44,24 @@ def get_image_hash(image_url: str) -> str:
         return digest.hexdigest()
     except Exception:
         head = requests.head(image_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
-        etag = head.headers.get("ETag", "")
-        last_modified = head.headers.get("Last-Modified", "")
-        fallback_base = f"{image_url}|{etag}|{last_modified}"
+        fallback_base = f"{image_url}|{head.headers.get('ETag','')}|{head.headers.get('Last-Modified','')}"
         return hashlib.sha256(fallback_base.encode("utf-8")).hexdigest()
 
 
-def make_row_key(source_url: str, src_index: int) -> str:
-    base = f"{src_index}|{source_url}"
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+def make_row_key(product_url: str, src_index: int) -> str:
+    return hashlib.sha256(f"{src_index}|{product_url}".encode("utf-8")).hexdigest()
 
 
-def extract_image_and_article_from_page(page_url: str) -> Tuple[str, str]:
-    # Пояснение: из входной страницы извлекаем URL основного изображения и артикул товара.
+def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, str]:
+    # Пояснение: с карточки товара извлекаем артикул и главное изображение.
     headers = {"User-Agent": "Mozilla/5.0 StopImages/2.0"}
-    resp = requests.get(page_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
+    resp = requests.get(product_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
     resp.raise_for_status()
 
-    content_type = resp.headers.get("content-type", "").lower()
-    if content_type.startswith("image/"):
-        return page_url, ""
+    if resp.headers.get("content-type", "").lower().startswith("image/"):
+        return "", product_url
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image and og_image.get("content"):
-        image_url = urljoin(page_url, og_image.get("content", ""))
-    else:
-        best_img = ""
-        best_score = -1
-        for img in soup.find_all("img"):
-            src = (img.get("src") or "").strip()
-            if not src:
-                continue
-            width = int(img.get("width") or 0)
-            height = int(img.get("height") or 0)
-            score = width * height
-            if score > best_score:
-                best_score = score
-                best_img = src
-        if not best_img:
-            raise ValueError("Не найдено изображение на странице")
-        image_url = urljoin(page_url, best_img)
 
     article = ""
     sku_meta = soup.find("meta", attrs={"property": "product:retailer_item_id"}) or soup.find(
@@ -95,45 +71,95 @@ def extract_image_and_article_from_page(page_url: str) -> Tuple[str, str]:
         article = sku_meta.get("content", "").strip()
 
     if not article:
-        selectors = [
-            "[itemprop='sku']",
-            ".sku",
-            "#sku",
-            "[data-sku]",
-            ".product-sku",
-            ".article",
-            "#article",
-        ]
-        for selector in selectors:
+        for selector in ["[itemprop='sku']", ".sku", "#sku", "[data-sku]", ".product-sku", ".article", "#article"]:
             node = soup.select_one(selector)
             if node:
                 article = (node.get("data-sku") or node.get_text(" ", strip=True) or "").strip()
                 if article:
                     break
 
-    return image_url, article
+    image_url = ""
+    og_image = soup.find("meta", attrs={"property": "og:image"})
+    if og_image and og_image.get("content"):
+        image_url = urljoin(product_url, og_image.get("content", ""))
+
+    if not image_url:
+        best_src = ""
+        best_score = -1
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").strip()
+            if not src:
+                continue
+            score = int(img.get("width") or 0) * int(img.get("height") or 0)
+            if score > best_score:
+                best_score = score
+                best_src = src
+        if best_src:
+            image_url = urljoin(product_url, best_src)
+
+    if not image_url:
+        raise ValueError("Не найдено изображение в карточке товара")
+
+    return article, image_url
 
 
-def show_tineye_help() -> None:
-    with st.expander("Параметры скрапинга TinEye", expanded=False):
-        # Пояснение: настройки скрапинга для запуска на Streamlit Cloud без API-ключей.
+def scrape_product_links_from_section(section_url: str) -> List[str]:
+    # Пояснение: со страницы раздела собираем ссылки на карточки товаров.
+    headers = {"User-Agent": "Mozilla/5.0 StopImages/2.0"}
+    resp = requests.get(section_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    base_host = urlparse(section_url).netloc.lower()
+
+    selectors = [
+        "a.product-item-link[href]",
+        "a.product-card[href]",
+        "a.catalog-item[href]",
+        "div.product-item a[href]",
+        "article a[href]",
+        "a[href]",
+    ]
+
+    links: List[str] = []
+    seen: Set[str] = set()
+
+    for selector in selectors:
+        for a in soup.select(selector):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith("#"):
+                continue
+            full = urljoin(section_url, href)
+            parsed = urlparse(full)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if parsed.netloc.lower() != base_host:
+                continue
+            # Фильтруем очевидно не-карточки.
+            if any(x in parsed.path.lower() for x in ["/catalog/", "/product/", "/item/"]):
+                if full not in seen:
+                    seen.add(full)
+                    links.append(full)
+
+    return links
+
+
+def show_help() -> None:
+    with st.expander("Как работает механика проверки", expanded=False):
+        # Пояснение: объясняем эквивалент механики "Search image on TinEye" в автоматическом режиме.
         st.markdown(
             """
-Приложение работает в режиме **скрапинга страницы результатов TinEye**.
-
-Добавьте (опционально) в `.streamlit/secrets.toml`:
-
-```toml
-TINEYE_BASE_URL = "https://tineye.com"
-```
-
-Если параметр не задан, используется `https://tineye.com`.
+1. Вы даете ссылку на раздел сайта.
+2. Приложение скрапит карточки товаров в разделе.
+3. Для каждой карточки извлекается изображение и выполняется поиск в TinEye.
+4. Это программный эквивалент ручного пункта **Search image on TinEye** из контекстного меню браузера.
+5. В отчет попадают только совпадения на доменах из `stocks_config.json`.
             """
         )
 
 
 def process_batch(
-    rows: List[Dict[str, str]],
+    products: List[Dict[str, str]],
     storage: Storage,
     tineye_client: TinEyeScraperClient,
     stock_rules,
@@ -142,8 +168,8 @@ def process_batch(
     top_n: int,
 ):
     start_idx = max(1, start_row) - 1
-    end_idx = min(len(rows), start_idx + batch_size)
-    batch = list(enumerate(rows[start_idx:end_idx], start=start_idx))
+    end_idx = min(len(products), start_idx + batch_size)
+    batch = list(enumerate(products[start_idx:end_idx], start=start_idx))
 
     run_id = storage.create_batch_run(start_row=start_row, batch_size=batch_size, top_n=top_n)
     progress = st.progress(0.0)
@@ -154,58 +180,43 @@ def process_batch(
     matched_count = 0
     batch_keys: List[str] = []
 
-    for i, (src_index, row) in enumerate(batch, start=1):
-        source_url = str(row.get("image_url", "")).strip()
-        row_key = make_row_key(source_url, src_index)
+    for i, (src_index, product) in enumerate(batch, start=1):
+        product_url = product["product_url"]
+        row_key = make_row_key(product_url, src_index)
         batch_keys.append(row_key)
-
-        status_box.info(f"Обработка строки {src_index + 1} ({i}/{len(batch)})")
-
-        if not source_url:
-            storage.upsert_row_status(row_key, status="error", image_hash=None, matches_count=0, error_text="Пустая ссылка")
-            error_count += 1
-            processed_count += 1
-            progress.progress(i / max(1, len(batch)))
-            continue
+        status_box.info(f"Обработка карточки {src_index + 1} ({i}/{len(batch)})")
 
         try:
-            image_url, article = extract_image_and_article_from_page(source_url)
+            article, image_url = extract_article_and_image_from_product_page(product_url)
             image_hash = get_image_hash(image_url)
-            cached_results = storage.get_cached_results(image_hash)
-            if cached_results is None:
+            cached = storage.get_cached_results(image_hash)
+            if cached is None:
                 tineye_results = tineye_client.search_by_url(image_url, top_n=top_n)
                 storage.set_cached_results(image_hash, tineye_results)
             else:
-                tineye_results = cached_results
+                tineye_results = cached
 
             report_rows = []
             for result in tineye_results:
-                page_url = result.get("page_url", "")
-                matched = classify_stock_url(page_url, stock_rules)
+                matched = classify_stock_url(result.get("page_url", ""), stock_rules)
                 if matched:
                     stock_url, _ = matched
-                    report_rows.append({"Ссылка на сток": stock_url, "Артикул товара": article})
+                    report_rows.append(
+                        {
+                            "Артикул товара": article,
+                            "Ссылка на сайт": product_url,
+                            "Ссылка на сток": stock_url,
+                        }
+                    )
 
-            storage.upsert_row_status(
-                row_key,
-                status="done",
-                image_hash=image_hash,
-                matches_count=len(report_rows),
-                error_text=None,
-            )
+            storage.upsert_row_status(row_key, "done", image_hash, len(report_rows), None)
             if report_rows:
                 storage.add_report_rows(row_key, report_rows)
                 matched_count += len(report_rows)
-
             processed_count += 1
+
         except Exception as exc:
-            storage.upsert_row_status(
-                row_key,
-                status="error",
-                image_hash=None,
-                matches_count=0,
-                error_text=str(exc),
-            )
+            storage.upsert_row_status(row_key, "error", None, 0, str(exc))
             error_count += 1
             processed_count += 1
 
@@ -214,33 +225,30 @@ def process_batch(
         )
         progress.progress(i / max(1, len(batch)))
 
-    storage.finish_batch_run(run_id, processed_count=processed_count, error_count=error_count, match_count=matched_count)
-    report_records = storage.get_report_rows_for_keys(batch_keys)
-    return report_records, {"processed": processed_count, "errors": error_count, "matches": matched_count}
+    storage.finish_batch_run(run_id, processed_count, error_count, matched_count)
+    return storage.get_report_rows_for_keys(batch_keys), {"processed": processed_count, "errors": error_count, "matches": matched_count}
 
 
 def main() -> None:
-    st.set_page_config(page_title="Проверка изображений со страниц сайта", layout="wide")
-    st.title("Проверка изображения по ссылке на страницу и выгрузка отчета")
+    st.set_page_config(page_title="Проверка раздела сайта через TinEye", layout="wide")
+    st.title("Проверка карточек товаров из раздела сайта")
 
     storage = Storage(DB_PATH)
     stock_rules = load_stock_rules(CONFIG_PATH)
-
-    settings = TinEyeScraperSettings(
-        base_url=read_secret_or_env("TINEYE_BASE_URL", "https://tineye.com"),
-        timeout_seconds=30,
+    tineye_client = TinEyeScraperClient(
+        TinEyeScraperSettings(base_url=read_secret_or_env("TINEYE_BASE_URL", "https://tineye.com"), timeout_seconds=30)
     )
-    tineye_client = TinEyeScraperClient(settings=settings)
-    show_tineye_help()
 
-    input_mode = st.radio("Способ ввода", ["Ручной ввод URL", "Загрузка XLS"], horizontal=True)
+    show_help()
+
+    input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
     source_df = None
     mapping_confirmed: Dict[str, str] = {}
 
-    if input_mode == "Ручной ввод URL":
-        text = st.text_area("Введите ссылки на страницы товаров (по одной на строку)", height=220)
+    if input_mode == "Ручной ввод URL разделов":
+        text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
         source_df = make_rows_from_manual_input(text)
-        mapping_confirmed = {"image_url": "image_url"}
+        mapping_confirmed = {"input_url": "input_url"}
     else:
         upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
         if upload is not None:
@@ -248,23 +256,21 @@ def main() -> None:
             st.dataframe(df_raw.head(10), use_container_width=True)
             auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
             st.subheader("Сопоставление колонок")
-
             if not needs_manual:
                 mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
                 st.success("Автосопоставление выполнено.")
             else:
-                st.warning("Автосопоставление неполное: укажите колонку со ссылкой вручную.")
+                st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
                 options = [""] + list(df_raw.columns)
-                field = "image_url"
-                default = auto_mapping.get(field) or ""
+                default = auto_mapping.get("input_url") or ""
                 selected = st.selectbox(
-                    FIELD_LABELS[field],
+                    FIELD_LABELS["input_url"],
                     options=options,
                     index=options.index(default) if default in options else 0,
-                    key="map_image_url",
+                    key="map_input_url",
                 )
                 if selected:
-                    mapping_confirmed[field] = selected
+                    mapping_confirmed["input_url"] = selected
 
             if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
                 source_df = make_rows_from_excel(df_raw, mapping_confirmed)
@@ -272,20 +278,42 @@ def main() -> None:
     if source_df is None:
         st.stop()
 
-    records = source_df.fillna("").to_dict(orient="records")
-    st.subheader("Параметры партии")
+    section_urls = [str(r.get("input_url", "")).strip() for r in source_df.fillna("").to_dict(orient="records") if str(r.get("input_url", "")).strip()]
+
+    products: List[Dict[str, str]] = []
+    if section_urls:
+        with st.expander("Найденные карточки товаров", expanded=False):
+            for section_url in section_urls:
+                try:
+                    links = scrape_product_links_from_section(section_url)
+                    st.write(f"{section_url} → найдено карточек: {len(links)}")
+                    products.extend({"product_url": link} for link in links)
+                except Exception as exc:
+                    st.warning(f"Ошибка парсинга раздела {section_url}: {exc}")
+
+    # Удаляем дубликаты карточек.
+    uniq = []
+    seen = set()
+    for item in products:
+        if item["product_url"] not in seen:
+            seen.add(item["product_url"])
+            uniq.append(item)
+    products = uniq
+
+    st.info(f"Всего карточек к проверке: {len(products)}")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         batch_size = st.selectbox("Размер партии", [50, 100, 200], index=0)
     with c2:
-        start_row = st.number_input("Стартовая строка (с 1)", min_value=1, value=1, step=1)
+        start_row = st.number_input("Стартовая карточка (с 1)", min_value=1, value=1, step=1)
     with c3:
         top_n = st.number_input("top_n результатов на изображение", min_value=1, max_value=100, value=20, step=1)
 
-    run = st.button("Запустить партию", type="primary", disabled=(len(records) == 0))
+    run = st.button("Запустить партию", type="primary", disabled=(len(products) == 0))
     if run:
         report_records, stats = process_batch(
-            rows=records,
+            products=products,
             storage=storage,
             tineye_client=tineye_client,
             stock_rules=stock_rules,
@@ -301,7 +329,7 @@ def main() -> None:
         st.download_button(
             label="Скачать XLSX-отчет",
             data=report_bytes,
-            file_name=f"batch_report_start{int(start_row)}_size{int(batch_size)}.xlsx",
+            file_name=f"stock_report_start{int(start_row)}_size{int(batch_size)}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 

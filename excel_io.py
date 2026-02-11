@@ -12,18 +12,17 @@ def read_excel(file_obj) -> pd.DataFrame:
 
 def make_rows_from_manual_input(text_area_value: str) -> pd.DataFrame:
     urls = [line.strip() for line in text_area_value.splitlines() if line.strip()]
-    return pd.DataFrame({"image_url": urls})
+    return pd.DataFrame({"input_url": urls})
 
 
 def make_rows_from_excel(df_source: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    # Пояснение: в отчетный пайплайн передаем только ссылку на страницу,
-    # артикул товара извлекается автоматически с HTML этой страницы.
-    return pd.DataFrame({"image_url": df_source[mapping["image_url"]]})
+    # Пояснение: в основной пайплайн передаем только ссылку на раздел каталога.
+    return pd.DataFrame({"input_url": df_source[mapping["input_url"]]})
 
 
 def build_report(records: List[Dict[str, str]]) -> bytes:
-    # Пояснение: колонки отчета строго по новому требованию пользователя.
-    report_columns = ["Ссылка на сток", "Артикул товара"]
+    # Пояснение: порядок и названия колонок строго под новое ТЗ.
+    report_columns = ["Артикул товара", "Ссылка на сайт", "Ссылка на сток"]
     report_df = pd.DataFrame(records, columns=report_columns)
 
     output = io.BytesIO()

@@ -3,23 +3,23 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, Optional, Tuple
 
-# Пояснение: в текущем сценарии обязательным считаем только URL страницы-источника,
-# где размещено изображение и откуда нужно извлечь артикул товара.
+# Пояснение: на входе теперь ссылка на раздел/страницу каталога,
+# поэтому обязательной является только колонка с URL раздела сайта.
 REQUIRED_FIELDS_SYNONYMS = {
-    "image_url": [
+    "input_url": [
         "ссылка",
+        "ссылка на раздел",
         "ссылка на сайт",
-        "ссылка на страницу",
         "url",
         "link",
-        "page_url",
-        "product_url",
-        "image_url",
+        "section_url",
+        "catalog_url",
+        "input_url",
     ],
 }
 
 FIELD_LABELS = {
-    "image_url": "Ссылка на страницу сайта",
+    "input_url": "Ссылка на раздел сайта",
 }
 
 
