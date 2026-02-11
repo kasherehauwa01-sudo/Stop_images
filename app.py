@@ -220,6 +220,22 @@ def scrape_product_links_from_section(section_url: str) -> List[str]:
 
 
 
+
+
+def build_tineye_search_url(base_url: str, image_url: str) -> str:
+    # Пояснение: формируем наглядный URL запроса TinEye для блока в интерфейсе.
+    from urllib.parse import urlencode
+
+    return f"{base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
+
+
+def render_tineye_request_url(url_placeholder, url_value: str) -> None:
+    # Пояснение: отдельный блок UI, где явно виден сформированный запрос к TinEye.
+    if not url_value:
+        url_placeholder.code("TinEye URL пока не сформирован.", language="text")
+    else:
+        url_placeholder.code(url_value, language="text")
+
 def init_logs() -> None:
     # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки в UI.
     if "ui_logs" not in st.session_state:
@@ -259,6 +275,7 @@ def process_batch(
     tineye_client: TinEyeScraperClient,
     batch_size: int,
     log_placeholder,
+    tineye_url_placeholder,
 ):
     # Пояснение: стартовая карточка фиксирована с первой позиции по требованию.
     start_idx = 0
@@ -291,6 +308,8 @@ def process_batch(
             cached = storage.get_cached_results(image_hash)
             if cached is None:
                 append_log(f"TinEye url-запрос с извлеченным image_url: {image_url}")
+                tineye_request_url = build_tineye_search_url(tineye_client.settings.base_url, image_url)
+                render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
                 # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не URL карточки.
                 tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
                 storage.set_cached_results(image_hash, tineye_results)
@@ -341,6 +360,7 @@ def check_single_url(
     source_url: str,
     storage: Storage,
     tineye_client: TinEyeScraperClient,
+    tineye_url_placeholder,
 ) -> List[Dict[str, str]]:
     # Пояснение: вкладка "Проверка URL" проверяет одно URL страницы без пакетного режима.
     source_url = source_url.strip()
@@ -354,6 +374,8 @@ def check_single_url(
     cached = storage.get_cached_results(image_hash)
     if cached is None:
         append_log(f"TinEye url-запрос для одиночной проверки с image_url: {image_url}")
+        tineye_request_url = build_tineye_search_url(tineye_client.settings.base_url, image_url)
+        render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
         # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не исходный URL страницы.
         results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
         storage.set_cached_results(image_hash, results)
@@ -389,6 +411,10 @@ def main() -> None:
     st.subheader("Логи обработки")
     log_placeholder = st.empty()
     render_logs(log_placeholder)
+
+    st.subheader("Сформированный TinEye URL запроса")
+    tineye_url_placeholder = st.empty()
+    render_tineye_request_url(tineye_url_placeholder, "")
 
     tab_batch, tab_single = st.tabs(["Пакетная проверка разделов", "Проверка URL"])
 
@@ -472,7 +498,7 @@ def main() -> None:
             append_log(f"Старт проверки одного URL: {one_url}")
             render_logs(log_placeholder)
             try:
-                rows = check_single_url(one_url, storage, tineye_client)
+                rows = check_single_url(one_url, storage, tineye_client, tineye_url_placeholder)
                 if rows:
                     st.success(f"Найдено совпадений на стоках: {len(rows)}")
                     st.dataframe(rows, use_container_width=True)
@@ -502,6 +528,7 @@ def main() -> None:
             tineye_client=tineye_client,
             batch_size=int(batch_size),
             log_placeholder=log_placeholder,
+            tineye_url_placeholder=tineye_url_placeholder,
         )
 
         st.success(
