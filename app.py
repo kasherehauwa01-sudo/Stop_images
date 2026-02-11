@@ -19,6 +19,7 @@ DB_PATH = Path("cache.db")
 CONFIG_PATH = Path("stocks_config.json")
 MAX_FILE_SIZE = 25 * 1024 * 1024
 TIMEOUT_SECONDS = 20
+DEFAULT_TOP_N = 20
 
 
 def get_image_hash(image_url: str) -> str:
@@ -184,16 +185,15 @@ def process_batch(
     storage: Storage,
     tineye_client: TinEyeScraperClient,
     stock_rules,
-    start_row: int,
     batch_size: int,
-    top_n: int,
     log_placeholder,
 ):
-    start_idx = max(1, start_row) - 1
+    # Пояснение: стартовая карточка фиксирована с первой позиции по требованию.
+    start_idx = 0
     end_idx = min(len(products), start_idx + batch_size)
     batch = list(enumerate(products[start_idx:end_idx], start=start_idx))
 
-    run_id = storage.create_batch_run(start_row=start_row, batch_size=batch_size, top_n=top_n)
+    run_id = storage.create_batch_run(start_row=1, batch_size=batch_size, top_n=DEFAULT_TOP_N)
     progress = st.progress(0.0)
     status_box = st.empty()
 
@@ -217,7 +217,7 @@ def process_batch(
             cached = storage.get_cached_results(image_hash)
             if cached is None:
                 append_log(f"TinEye запрос для {product_url}")
-                tineye_results = tineye_client.search_by_url(image_url, top_n=top_n)
+                tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
                 storage.set_cached_results(image_hash, tineye_results)
                 append_log(f"Кэш сохранен: {image_hash[:12]}")
             else:
@@ -262,6 +262,41 @@ def process_batch(
     return storage.get_report_rows_for_keys(batch_keys), {"processed": processed_count, "errors": error_count, "matches": matched_count}
 
 
+def check_single_url(
+    source_url: str,
+    storage: Storage,
+    tineye_client: TinEyeScraperClient,
+    stock_rules,
+) -> List[Dict[str, str]]:
+    # Пояснение: вкладка "Проверка URL" проверяет одно URL страницы без пакетного режима.
+    source_url = source_url.strip()
+    if not source_url:
+        return []
+
+    article, image_url = extract_article_and_image_from_product_page(source_url)
+    image_hash = get_image_hash(image_url)
+    cached = storage.get_cached_results(image_hash)
+    if cached is None:
+        append_log(f"TinEye запрос для одиночной проверки: {source_url}")
+        results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
+        storage.set_cached_results(image_hash, results)
+    else:
+        append_log(f"Одиночная проверка: использован кэш {image_hash[:12]}")
+        results = cached
+
+    rows: List[Dict[str, str]] = []
+    for item in results:
+        matched = classify_stock_url(item.get("page_url", ""), stock_rules)
+        if matched:
+            stock_url, _ = matched
+            rows.append({
+                "Артикул товара": article,
+                "Ссылка на сайт": source_url,
+                "Ссылка на сток": stock_url,
+            })
+    return rows
+
+
 def main() -> None:
     st.set_page_config(page_title="Проверка раздела сайта через TinEye", layout="wide")
     st.title("Проверка карточек товаров из раздела сайта")
@@ -279,82 +314,108 @@ def main() -> None:
     log_placeholder = st.empty()
     render_logs(log_placeholder)
 
-    input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
-    source_df = None
-    mapping_confirmed: Dict[str, str] = {}
+    tab_batch, tab_single = st.tabs(["Пакетная проверка разделов", "Проверка URL"])
 
-    if input_mode == "Ручной ввод URL разделов":
-        text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
-        source_df = make_rows_from_manual_input(text)
-        mapping_confirmed = {"input_url": "input_url"}
-    else:
-        upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
-        if upload is not None:
-            df_raw = read_excel(upload)
-            st.dataframe(df_raw.head(10), use_container_width=True)
-            auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
-            st.subheader("Сопоставление колонок")
-            if not needs_manual:
-                mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
-                st.success("Автосопоставление выполнено.")
-            else:
-                st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
-                options = [""] + list(df_raw.columns)
-                default = auto_mapping.get("input_url") or ""
-                selected = st.selectbox(
-                    FIELD_LABELS["input_url"],
-                    options=options,
-                    index=options.index(default) if default in options else 0,
-                    key="map_input_url",
-                )
-                if selected:
-                    mapping_confirmed["input_url"] = selected
+    with tab_batch:
+        input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
+        source_df = None
+        mapping_confirmed: Dict[str, str] = {}
 
-            if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
-                source_df = make_rows_from_excel(df_raw, mapping_confirmed)
+        if input_mode == "Ручной ввод URL разделов":
+            text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
+            source_df = make_rows_from_manual_input(text)
+            mapping_confirmed = {"input_url": "input_url"}
+        else:
+            upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
+            if upload is not None:
+                df_raw = read_excel(upload)
+                st.dataframe(df_raw.head(10), use_container_width=True)
+                auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
+                st.subheader("Сопоставление колонок")
+                if not needs_manual:
+                    mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
+                    st.success("Автосопоставление выполнено.")
+                else:
+                    st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
+                    options = [""] + list(df_raw.columns)
+                    default = auto_mapping.get("input_url") or ""
+                    selected = st.selectbox(
+                        FIELD_LABELS["input_url"],
+                        options=options,
+                        index=options.index(default) if default in options else 0,
+                        key="map_input_url",
+                    )
+                    if selected:
+                        mapping_confirmed["input_url"] = selected
 
-    if source_df is None:
-        st.stop()
+                if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
+                    source_df = make_rows_from_excel(df_raw, mapping_confirmed)
 
-    section_urls = [str(r.get("input_url", "")).strip() for r in source_df.fillna("").to_dict(orient="records") if str(r.get("input_url", "")).strip()]
+        products: List[Dict[str, str]] = []
+        if source_df is not None:
+            section_urls = [
+                str(r.get("input_url", "")).strip()
+                for r in source_df.fillna("").to_dict(orient="records")
+                if str(r.get("input_url", "")).strip()
+            ]
+            if section_urls:
+                with st.expander("Найденные карточки товаров", expanded=False):
+                    for section_url in section_urls:
+                        try:
+                            links = scrape_product_links_from_section(section_url)
+                            line = f"{section_url} → найдено карточек: {len(links)}"
+                            st.write(line)
+                            append_log(line)
+                            render_logs(log_placeholder)
+                            products.extend({"product_url": link} for link in links)
+                        except Exception as exc:
+                            warn = f"Ошибка парсинга раздела {section_url}: {exc}"
+                            st.warning(warn)
+                            append_log(warn)
+                            render_logs(log_placeholder)
 
-    products: List[Dict[str, str]] = []
-    if section_urls:
-        with st.expander("Найденные карточки товаров", expanded=False):
-            for section_url in section_urls:
-                try:
-                    links = scrape_product_links_from_section(section_url)
-                    line = f"{section_url} → найдено карточек: {len(links)}"
-                    st.write(line)
-                    append_log(line)
-                    render_logs(log_placeholder)
-                    products.extend({"product_url": link} for link in links)
-                except Exception as exc:
-                    warn = f"Ошибка парсинга раздела {section_url}: {exc}"
-                    st.warning(warn)
-                    append_log(warn)
-                    render_logs(log_placeholder)
+        uniq = []
+        seen = set()
+        for item in products:
+            if item["product_url"] not in seen:
+                seen.add(item["product_url"])
+                uniq.append(item)
+        products = uniq
 
-    # Удаляем дубликаты карточек.
-    uniq = []
-    seen = set()
-    for item in products:
-        if item["product_url"] not in seen:
-            seen.add(item["product_url"])
-            uniq.append(item)
-    products = uniq
+        st.info(f"Всего карточек к проверке: {len(products)}")
 
-    st.info(f"Всего карточек к проверке: {len(products)}")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
         batch_size = st.selectbox("Размер партии", [50, 100, 200], index=0)
-    with c2:
-        start_row = st.number_input("Стартовая карточка (с 1)", min_value=1, value=1, step=1)
-    with c3:
-        top_n = st.number_input("top_n результатов на изображение", min_value=1, max_value=100, value=20, step=1)
+        run = st.button("Запустить партию", type="primary", disabled=(len(products) == 0), key="run_batch")
 
-    run = st.button("Запустить партию", type="primary", disabled=(len(products) == 0))
+    with tab_single:
+        # Пояснение: отдельная вкладка для проверки одной страницы по URL.
+        one_url = st.text_input("Введите URL страницы товара")
+        run_one = st.button("Проверить URL", type="primary", key="run_one")
+        if run_one:
+            st.session_state["ui_logs"] = []
+            append_log(f"Старт проверки одного URL: {one_url}")
+            render_logs(log_placeholder)
+            try:
+                rows = check_single_url(one_url, storage, tineye_client, stock_rules)
+                if rows:
+                    st.success(f"Найдено совпадений на стоках: {len(rows)}")
+                    st.dataframe(rows, use_container_width=True)
+                    st.download_button(
+                        label="Скачать XLSX-отчет по URL",
+                        data=build_report(rows),
+                        file_name="single_url_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_one",
+                    )
+                else:
+                    st.info("Совпадения на стоках не найдены.")
+                append_log("Одиночная проверка завершена")
+                render_logs(log_placeholder)
+            except Exception as exc:
+                st.error(f"Ошибка проверки URL: {exc}")
+                append_log(f"Ошибка одиночной проверки: {exc}")
+                render_logs(log_placeholder)
+
     if run:
         st.session_state["ui_logs"] = []
         append_log("Старт пакетной обработки")
@@ -364,9 +425,7 @@ def main() -> None:
             storage=storage,
             tineye_client=tineye_client,
             stock_rules=stock_rules,
-            start_row=int(start_row),
             batch_size=int(batch_size),
-            top_n=int(top_n),
             log_placeholder=log_placeholder,
         )
 
@@ -377,7 +436,7 @@ def main() -> None:
         st.download_button(
             label="Скачать XLSX-отчет",
             data=report_bytes,
-            file_name=f"stock_report_start{int(start_row)}_size{int(batch_size)}.xlsx",
+            file_name=f"stock_report_size{int(batch_size)}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
