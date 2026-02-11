@@ -22,7 +22,7 @@ def make_rows_from_excel(df_source: pd.DataFrame, mapping: Dict[str, str]) -> pd
 
 def build_report(records: List[Dict[str, str]]) -> bytes:
     # Пояснение: порядок и названия колонок строго под новое ТЗ.
-    report_columns = ["Артикул товара", "Ссылка на сайт", "Ссылка на сток"]
+    report_columns = ["Артикул товара", "Ссылка на сайт", "Ссылка в результатах TinEye"]
     report_df = pd.DataFrame(records, columns=report_columns)
 
     output = io.BytesIO()

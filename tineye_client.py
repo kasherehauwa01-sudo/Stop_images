@@ -28,42 +28,18 @@ class TinEyeScraperClient:
     def is_configured(self) -> bool:
         return bool(self.settings.base_url)
 
-    def search_by_upload(
-        self,
-        image_bytes: bytes,
-        filename: str = "image.jpg",
-        mime_type: str = "image/jpeg",
-        top_n: int = 20,
-    ) -> List[Dict[str, str]]:
-        # Пояснение: эмулируем загрузку изображения в веб-интерфейс tineye.com,
-        # как при ручном действии "Search image on TinEye".
+    def search_by_url(self, image_url: str, top_n: int = 20) -> List[Dict[str, str]]:
+        # Пояснение: сценарий строго по ТЗ — передаем URL изображения в поле
+        # "Search by image url" на странице tineye.com/search.
         search_url = self.settings.base_url.rstrip("/") + "/search"
-
-        candidate_fields = ["image", "file", "upload", "image_upload", "imgfile"]
-        last_error: Optional[Exception] = None
-
-        for field in candidate_fields:
-            try:
-                response = self.session.post(
-                    search_url,
-                    files={field: (filename, image_bytes, mime_type)},
-                    timeout=self.settings.timeout_seconds,
-                    allow_redirects=True,
-                )
-                if response.status_code >= 400:
-                    continue
-                parsed = self._parse_results(response.text, response.url, top_n=top_n)
-                if parsed:
-                    return parsed
-            except Exception as exc:
-                last_error = exc
-                continue
-
-        if last_error:
-            raise last_error
-
-        # fallback: если интерфейс не принял multipart-имя поля, возвращаем пусто.
-        return []
+        response = self.session.get(
+            search_url,
+            params={"url": image_url},
+            timeout=self.settings.timeout_seconds,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        return self._parse_results(response.text, response.url, top_n=top_n)
 
     def _extract_external_url(self, raw_href: str, final_url: str) -> Optional[str]:
         if not raw_href:

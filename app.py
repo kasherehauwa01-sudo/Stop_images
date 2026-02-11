@@ -9,14 +9,13 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-from config import classify_stock_url, load_stock_rules, read_secret_or_env
+from config import read_secret_or_env
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
 from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns
 from storage import Storage
 from tineye_client import TinEyeScraperClient, TinEyeScraperSettings
 
 DB_PATH = Path("cache.db")
-CONFIG_PATH = Path("stocks_config.json")
 MAX_FILE_SIZE = 25 * 1024 * 1024
 TIMEOUT_SECONDS = 20
 DEFAULT_TOP_N = 20
@@ -258,7 +257,6 @@ def process_batch(
     products: List[Dict[str, str]],
     storage: Storage,
     tineye_client: TinEyeScraperClient,
-    stock_rules,
     batch_size: int,
     log_placeholder,
 ):
@@ -288,17 +286,12 @@ def process_batch(
         try:
             article, image_url = extract_article_and_image_from_product_page(product_url)
             append_log(f"Извлечено изображение: {image_url}")
-            image_bytes, filename, mime_type = download_image_bytes(image_url)
+            image_bytes, _, _ = download_image_bytes(image_url)
             image_hash = hashlib.sha256(image_bytes).hexdigest()
             cached = storage.get_cached_results(image_hash)
             if cached is None:
-                append_log(f"TinEye upload-запрос для {product_url}")
-                tineye_results = tineye_client.search_by_upload(
-                    image_bytes=image_bytes,
-                    filename=filename,
-                    mime_type=mime_type,
-                    top_n=DEFAULT_TOP_N,
-                )
+                append_log(f"TinEye url-запрос для {product_url}")
+                tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
                 storage.set_cached_results(image_hash, tineye_results)
                 append_log(f"Кэш сохранен: {image_hash[:12]}")
             else:
@@ -307,15 +300,14 @@ def process_batch(
 
             report_rows = []
             for result in tineye_results:
-                append_log(f"TinEye результат: {result.get('page_url', '')}")
-                matched = classify_stock_url(result.get("page_url", ""), stock_rules)
-                if matched:
-                    stock_url, _ = matched
+                result_url = result.get("page_url", "")
+                append_log(f"TinEye результат: {result_url}")
+                if result_url:
                     report_rows.append(
                         {
                             "Артикул товара": article,
                             "Ссылка на сайт": product_url,
-                            "Ссылка на сток": stock_url,
+                            "Ссылка в результатах TinEye": result_url,
                         }
                     )
 
@@ -348,7 +340,6 @@ def check_single_url(
     source_url: str,
     storage: Storage,
     tineye_client: TinEyeScraperClient,
-    stock_rules,
 ) -> List[Dict[str, str]]:
     # Пояснение: вкладка "Проверка URL" проверяет одно URL страницы без пакетного режима.
     source_url = source_url.strip()
@@ -357,17 +348,12 @@ def check_single_url(
 
     article, image_url = extract_article_and_image_from_product_page(source_url)
     append_log(f"Одиночная проверка: извлечено изображение {image_url}")
-    image_bytes, filename, mime_type = download_image_bytes(image_url)
+    image_bytes, _, _ = download_image_bytes(image_url)
     image_hash = hashlib.sha256(image_bytes).hexdigest()
     cached = storage.get_cached_results(image_hash)
     if cached is None:
-        append_log(f"TinEye upload-запрос для одиночной проверки: {source_url}")
-        results = tineye_client.search_by_upload(
-            image_bytes=image_bytes,
-            filename=filename,
-            mime_type=mime_type,
-            top_n=DEFAULT_TOP_N,
-        )
+        append_log(f"TinEye url-запрос для одиночной проверки: {source_url}")
+        results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
         storage.set_cached_results(image_hash, results)
     else:
         append_log(f"Одиночная проверка: использован кэш {image_hash[:12]}")
@@ -375,14 +361,13 @@ def check_single_url(
 
     rows: List[Dict[str, str]] = []
     for item in results:
-        append_log(f"TinEye результат: {item.get('page_url', '')}")
-        matched = classify_stock_url(item.get("page_url", ""), stock_rules)
-        if matched:
-            stock_url, _ = matched
+        result_url = item.get("page_url", "")
+        append_log(f"TinEye результат: {result_url}")
+        if result_url:
             rows.append({
                 "Артикул товара": article,
                 "Ссылка на сайт": source_url,
-                "Ссылка на сток": stock_url,
+                "Ссылка в результатах TinEye": result_url,
             })
     return rows
 
@@ -392,7 +377,6 @@ def main() -> None:
     st.title("Проверка карточек товаров из раздела сайта")
 
     storage = Storage(DB_PATH)
-    stock_rules = load_stock_rules(CONFIG_PATH)
     tineye_client = TinEyeScraperClient(
         TinEyeScraperSettings(base_url=read_secret_or_env("TINEYE_BASE_URL", "https://tineye.com"), timeout_seconds=30)
     )
@@ -486,7 +470,7 @@ def main() -> None:
             append_log(f"Старт проверки одного URL: {one_url}")
             render_logs(log_placeholder)
             try:
-                rows = check_single_url(one_url, storage, tineye_client, stock_rules)
+                rows = check_single_url(one_url, storage, tineye_client)
                 if rows:
                     st.success(f"Найдено совпадений на стоках: {len(rows)}")
                     st.dataframe(rows, use_container_width=True)
@@ -514,7 +498,6 @@ def main() -> None:
             products=products,
             storage=storage,
             tineye_client=tineye_client,
-            stock_rules=stock_rules,
             batch_size=int(batch_size),
             log_placeholder=log_placeholder,
         )
