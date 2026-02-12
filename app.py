@@ -103,8 +103,48 @@ def is_probably_technical_image(url: str, css_classes: str = "", alt_text: str =
     return any(hint in sample for hint in TECH_IMAGE_HINTS)
 
 
+
+
+def _looks_like_800x800(node, image_url: str) -> bool:
+    # Пояснение: целимся в основное фото карточки, которое часто имеет размер 800x800.
+    sample = image_url.lower()
+    if "800x800" in sample or "/800/800" in sample or "w=800" in sample:
+        return True
+
+    width = str(node.get("width", "")).strip()
+    height = str(node.get("height", "")).strip()
+    if width == "800" and height == "800":
+        return True
+
+    data_w = str(node.get("data-width", "")).strip()
+    data_h = str(node.get("data-height", "")).strip()
+    if data_w == "800" and data_h == "800":
+        return True
+
+    return False
+
 def extract_main_product_image(soup: BeautifulSoup, product_url: str) -> Optional[str]:
-    # Пояснение: берем именно главное изображение карточки, а не все картинки страницы.
+    # Пояснение: приоритетно берем фото из блока карточки
+    # product-detail-gallery__picture rounded3 zoom_picture lazyloaded.
+    strict_selector = "img.product-detail-gallery__picture.rounded3.zoom_picture.lazyloaded"
+    strict_candidates = []
+    for node in soup.select(strict_selector):
+        raw = (node.get("src") or node.get("data-src") or node.get("data-original") or "").strip()
+        if not raw:
+            continue
+        full = urljoin(product_url, raw)
+        if is_probably_technical_image(full, " ".join(node.get("class", [])), node.get("alt", "")):
+            continue
+        strict_candidates.append((node, full))
+
+    # Пояснение: если среди строгих кандидатов есть вариант 800x800 — берем его первым.
+    for node, full in strict_candidates:
+        if _looks_like_800x800(node, full):
+            return full
+    if strict_candidates:
+        return strict_candidates[0][1]
+
+    # Пояснение: fallback на другие селекторы карточки, если строгий класс не найден.
     priority_selectors = [
         "meta[property='og:image']",
         "meta[name='twitter:image']",
@@ -126,7 +166,7 @@ def extract_main_product_image(soup: BeautifulSoup, product_url: str) -> Optiona
                 continue
             return full
 
-    # Пояснение: fallback — первый нетехнический img, если явного главного селектора нет.
+    # Пояснение: последний fallback — первый нетехнический img, если явного главного селектора нет.
     for img in soup.select("img"):
         raw = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
         if not raw:
