@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -29,8 +30,7 @@ class TinEyeScraperClient:
         return bool(self.settings.base_url)
 
     def search_by_url(self, image_url: str, top_n: int = 20) -> List[Dict[str, str]]:
-        # Пояснение: сценарий строго по ТЗ — передаем URL изображения в поле
-        # "Search by image url" на странице tineye.com/search.
+        # Пояснение: передаем URL изображения в поле Search by image url.
         search_url = self.settings.base_url.rstrip("/") + "/search"
         response = self.session.get(
             search_url,
@@ -57,11 +57,38 @@ class TinEyeScraperClient:
                 c_parsed = urlparse(candidate)
                 if c_parsed.scheme in {"http", "https"}:
                     return candidate
+
+        # Пояснение: иногда целевая ссылка лежит в JS-обработчиках.
+        js_match = re.search(r"https?://[^'\"\s)]+", raw_href)
+        if js_match:
+            return js_match.group(0)
+
         return None
+
+    def _extract_domain_from_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        m = re.search(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", text.lower())
+        if not m:
+            return None
+        domain = m.group(1).strip(".")
+        if domain.endswith("tineye.com"):
+            return None
+        return domain
 
     def _parse_results(self, html: str, final_url: str, top_n: int) -> List[Dict[str, str]]:
         soup = BeautifulSoup(html, "html.parser")
         normalized: List[Dict[str, str]] = []
+        seen = set()
+
+        def push(url: str, title: str = "") -> None:
+            if not url or url in seen:
+                return
+            seen.add(url)
+            host = urlparse(url).netloc.lower()
+            if not host or host.endswith("tineye.com"):
+                return
+            normalized.append({"page_url": url, "domain": host, "title": (title or "")[:500]})
 
         selectors = [
             "div.match a[href]",
@@ -69,36 +96,38 @@ class TinEyeScraperClient:
             "section.results a[href]",
             "ul.matches a[href]",
             "a.match-link[href]",
-            "a[href*='shutterstock']",
             "[data-href]",
+            "a[href]",
         ]
 
-        candidates = []
         for selector in selectors:
-            candidates.extend(soup.select(selector))
+            for node in soup.select(selector):
+                href = (node.get("href") or node.get("data-href") or "").strip()
+                ext_url = self._extract_external_url(href, final_url)
+                if ext_url:
+                    push(ext_url, node.get_text(" ", strip=True))
+                if len(normalized) >= top_n:
+                    return normalized[:top_n]
 
-        # Пояснение: если целевые селекторы ничего не дали,
-        # делаем fallback на все ссылки страницы результатов.
-        if not candidates:
-            candidates = soup.select("a[href], [data-href]")
+        # Пояснение: fallback №1 — ищем абсолютные URL прямо в скриптах страницы.
+        for script in soup.find_all("script"):
+            text = script.string or script.get_text() or ""
+            for url in re.findall(r"https?://[^'\"\s<>()]+", text):
+                if "tineye.com" in url.lower():
+                    continue
+                push(url)
+                if len(normalized) >= top_n:
+                    return normalized[:top_n]
 
-        seen = set()
-        for node in candidates:
-            href = ""
-            if node.has_attr("href"):
-                href = (node.get("href") or "").strip()
-            elif node.has_attr("data-href"):
-                href = (node.get("data-href") or "").strip()
+        # Пояснение: fallback №2 — если есть домен в текстовом блоке результата,
+        # формируем URL вида https://domain.
+        card_selectors = [".match", ".result", "li", "article", ".results > div", "body"]
+        for selector in card_selectors:
+            for node in soup.select(selector):
+                domain = self._extract_domain_from_text(node.get_text(" ", strip=True))
+                if domain:
+                    push(f"https://{domain}", node.get_text(" ", strip=True))
+                if len(normalized) >= top_n:
+                    return normalized[:top_n]
 
-            ext_url = self._extract_external_url(href, final_url)
-            if not ext_url or ext_url in seen:
-                continue
-            seen.add(ext_url)
-
-            host = urlparse(ext_url).netloc.lower()
-            title = (node.get_text(" ", strip=True) or "")[:500]
-            normalized.append({"page_url": ext_url, "domain": host, "title": title})
-            if len(normalized) >= top_n:
-                break
-
-        return normalized
+        return normalized[:top_n]
