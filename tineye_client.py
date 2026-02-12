@@ -45,6 +45,37 @@ class TinEyeScraperClient:
     def is_configured(self) -> bool:
         return bool(self.settings.base_url)
 
+    def apply_cookie_header(self, cookie_header: str) -> None:
+        # Пояснение: полуавтоматический режим — пользователь вручную проходит
+        # проверку в браузере и передает Cookie из DevTools в приложение.
+        self.session.cookies.clear()
+        if not cookie_header:
+            return
+
+        parsed_base = urlparse(self.settings.base_url)
+        default_domain = parsed_base.netloc.split(":")[0] or "tineye.com"
+
+        for chunk in cookie_header.split(";"):
+            part = chunk.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if not name:
+                continue
+            self.session.cookies.set(name, value.strip(), domain=default_domain)
+
+    def is_interstitial_html(self, html_text: str) -> bool:
+        lowered = html_text.lower()
+        markers = [
+            "just a moment",
+            "checking your browser before accessing",
+            "cf-browser-verification",
+            "challenge-form",
+            "ray id",
+        ]
+        return any(marker in lowered for marker in markers)
+
     def build_search_url(self, image_url: str) -> str:
         return f"{self.settings.base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
 
@@ -61,6 +92,11 @@ class TinEyeScraperClient:
             allow_redirects=True,
         )
         response.raise_for_status()
+        if self.is_interstitial_html(response.text):
+            raise RuntimeError(
+                "TinEye вернул anti-bot страницу (Just a moment). "
+                "Пройдите проверку вручную в браузере и вставьте актуальный Cookie в блоке 'Полуавтоматический режим'."
+            )
         return self._parse_results(response.text, response.url, top_n=top_n)
 
     def _extract_external_url(self, raw_href: str, final_url: str) -> Optional[str]:
@@ -100,6 +136,20 @@ class TinEyeScraperClient:
                 seen.add(domain)
                 out.append(domain)
         return out
+
+    def _extract_shutterstock_urls_from_raw_html(self, html_text: str) -> List[str]:
+        # Пояснение: целевой строгий парсинг только ссылок вида https://www.shutterstock.com/...
+        decoded = ihtml.unescape(html_text)
+        pattern = re.compile(r'https://www\.shutterstock\.com[^\s"\'<>]+', re.IGNORECASE)
+        found = pattern.findall(decoded)
+        uniq: List[str] = []
+        seen = set()
+        for url in found:
+            clean = url.rstrip('\",}]')
+            if clean not in seen:
+                seen.add(clean)
+                uniq.append(clean)
+        return uniq
 
     def _extract_stock_urls_from_raw_html(self, html_text: str) -> List[str]:
         # Пояснение: доп. fallback для страниц, где стоковые URL лежат в JSON/JS.
@@ -198,19 +248,25 @@ class TinEyeScraperClient:
                     if len(normalized) >= top_n:
                         return normalized[:top_n]
 
-        # 4) Стоковые URL по сырому HTML
+        # 4) Жесткий целевой fallback: ссылки shutterstock с нужным префиксом
+        for stock_url in self._extract_shutterstock_urls_from_raw_html(html):
+            push(stock_url, "raw_html_shutterstock_match")
+            if len(normalized) >= top_n:
+                return normalized[:top_n]
+
+        # 5) Стоковые URL по сырому HTML
         for stock_url in self._extract_stock_urls_from_raw_html(html):
             push(stock_url, "raw_html_stock_match")
             if len(normalized) >= top_n:
                 return normalized[:top_n]
 
-        # 5) URL из экранированного JSON (https:\/\/...)
+        # 6) URL из экранированного JSON (https:\/\/...)
         for url in self._extract_urls_from_escaped_json(html):
             push(url, "escaped_json_match")
             if len(normalized) >= top_n:
                 return normalized[:top_n]
 
-        # 6) Домены стоков, встречающиеся в тексте, даже без полной ссылки
+        # 7) Домены стоков, встречающиеся в тексте, даже без полной ссылки
         for domain_url in self._extract_known_domains_from_html(html):
             push(domain_url, "known_domain_in_html")
             if len(normalized) >= top_n:
