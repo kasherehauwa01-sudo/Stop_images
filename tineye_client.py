@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as ihtml
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -13,6 +14,18 @@ from bs4 import BeautifulSoup
 class TinEyeScraperSettings:
     base_url: str
     timeout_seconds: int = 30
+
+
+STOCK_DOMAINS_FOR_RAW_PARSE = [
+    "shutterstock.com",
+    "stock.adobe.com",
+    "istockphoto.com",
+    "depositphotos.com",
+    "dreamstime.com",
+    "123rf.com",
+    "alamy.com",
+    "freepik.com",
+]
 
 
 class TinEyeScraperClient:
@@ -33,12 +46,12 @@ class TinEyeScraperClient:
         return f"{self.settings.base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
 
     def search_by_url(self, image_url: str, top_n: int = 20) -> List[Dict[str, str]]:
-        # Пояснение: строим URL для поля "Search by image url" и парсим именно эту страницу результатов.
+        # Пояснение: передаем URL изображения в поле Search by image url.
         request_url = self.build_search_url(image_url)
         return self.search_by_tineye_url(request_url, top_n=top_n)
 
     def search_by_tineye_url(self, request_url: str, top_n: int = 20) -> List[Dict[str, str]]:
-        # Пояснение: отдельный метод для явного парсинга уже сформированного TinEye URL из UI.
+        # Пояснение: парсим именно сформированный TinEye URL из UI.
         response = self.session.get(
             request_url,
             timeout=self.settings.timeout_seconds,
@@ -85,6 +98,22 @@ class TinEyeScraperClient:
                 out.append(domain)
         return out
 
+    def _extract_stock_urls_from_raw_html(self, html_text: str) -> List[str]:
+        # Пояснение: доп. fallback для страниц, где стоковые URL лежат в JSON/JS.
+        decoded = ihtml.unescape(html_text)
+        joined_domains = "|".join(re.escape(d) for d in STOCK_DOMAINS_FOR_RAW_PARSE)
+        pattern = re.compile(rf'https?://(?:www\.)?(?:{joined_domains})[^\s"\'<>]+', re.IGNORECASE)
+        found = pattern.findall(decoded)
+
+        uniq: List[str] = []
+        seen = set()
+        for url in found:
+            clean = url.rstrip('\\",}]')
+            if clean not in seen:
+                seen.add(clean)
+                uniq.append(clean)
+        return uniq
+
     def _parse_results(self, html: str, final_url: str, top_n: int) -> List[Dict[str, str]]:
         soup = BeautifulSoup(html, "html.parser")
         normalized: List[Dict[str, str]] = []
@@ -116,7 +145,6 @@ class TinEyeScraperClient:
                 ext_url = self._extract_external_url(href, final_url)
                 if ext_url:
                     push(ext_url, node.get_text(" ", strip=True))
-                # Доп. извлечение из dataset-атрибутов
                 for attr in ("data-url", "data-link", "data-target", "data-domain"):
                     value = (node.get(attr) or "").strip()
                     if value.startswith("http"):
@@ -145,5 +173,11 @@ class TinEyeScraperClient:
                     push(f"https://{domain}", text)
                     if len(normalized) >= top_n:
                         return normalized[:top_n]
+
+        # 4) Стоковые URL по сырому HTML
+        for stock_url in self._extract_stock_urls_from_raw_html(html):
+            push(stock_url, "raw_html_stock_match")
+            if len(normalized) >= top_n:
+                return normalized[:top_n]
 
         return normalized[:top_n]
