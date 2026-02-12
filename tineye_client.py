@@ -45,6 +45,37 @@ class TinEyeScraperClient:
     def is_configured(self) -> bool:
         return bool(self.settings.base_url)
 
+    def apply_cookie_header(self, cookie_header: str) -> None:
+        # Пояснение: полуавтоматический режим — пользователь вручную проходит
+        # проверку в браузере и передает Cookie из DevTools в приложение.
+        self.session.cookies.clear()
+        if not cookie_header:
+            return
+
+        parsed_base = urlparse(self.settings.base_url)
+        default_domain = parsed_base.netloc.split(":")[0] or "tineye.com"
+
+        for chunk in cookie_header.split(";"):
+            part = chunk.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if not name:
+                continue
+            self.session.cookies.set(name, value.strip(), domain=default_domain)
+
+    def is_interstitial_html(self, html_text: str) -> bool:
+        lowered = html_text.lower()
+        markers = [
+            "just a moment",
+            "checking your browser before accessing",
+            "cf-browser-verification",
+            "challenge-form",
+            "ray id",
+        ]
+        return any(marker in lowered for marker in markers)
+
     def build_search_url(self, image_url: str) -> str:
         return f"{self.settings.base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
 
@@ -61,6 +92,11 @@ class TinEyeScraperClient:
             allow_redirects=True,
         )
         response.raise_for_status()
+        if self.is_interstitial_html(response.text):
+            raise RuntimeError(
+                "TinEye вернул anti-bot страницу (Just a moment). "
+                "Пройдите проверку вручную в браузере и вставьте актуальный Cookie в блоке 'Полуавтоматический режим'."
+            )
         return self._parse_results(response.text, response.url, top_n=top_n)
 
     def _extract_external_url(self, raw_href: str, final_url: str) -> Optional[str]:

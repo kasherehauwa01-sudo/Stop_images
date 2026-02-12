@@ -257,6 +257,37 @@ def render_last_tineye_rows() -> None:
     else:
         st.caption("Пока нет данных для отображения.")
 
+
+
+def render_semi_auto_help() -> None:
+    # Пояснение: объясняем, как передать сессию после ручного прохождения browser-check.
+    with st.expander("Полуавтоматический режим TinEye (ручной проход проверки)", expanded=False):
+        st.markdown(
+            """
+1. Откройте `https://tineye.com/` в обычном браузере и вручную пройдите проверку (`Just a moment...`).
+2. Откройте DevTools → `Application/Storage` → `Cookies` (или вкладка `Network`, любой запрос к `tineye.com`).
+3. Скопируйте строку cookie в формате `name1=value1; name2=value2`.
+4. Вставьте её в поле **Cookie сессии TinEye** ниже и нажмите **Применить Cookie**.
+5. После этого запускайте пакетную/одиночную проверку из приложения.
+
+⚠️ Cookie со временем протухает. Если снова видите anti-bot ошибку, получите свежую cookie и примените заново.
+            """
+        )
+
+
+def init_tineye_cookie_state() -> None:
+    # Пояснение: храним cookie в session_state, чтобы использовать её в текущей сессии Streamlit.
+    st.session_state.setdefault("tineye_cookie", "")
+
+
+def render_cookie_status() -> None:
+    # Пояснение: показываем пользователю текущий статус полуавтоматической сессии.
+    cookie_set = bool(st.session_state.get("tineye_cookie", "").strip())
+    if cookie_set:
+        st.success("Cookie TinEye применена для текущей сессии приложения.")
+    else:
+        st.info("Cookie TinEye не задана. Возможна блокировка anti-bot на стороне TinEye.")
+
 def init_logs() -> None:
     # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки в UI.
     if "ui_logs" not in st.session_state:
@@ -285,7 +316,7 @@ def show_help() -> None:
 2. Приложение скрапит карточки товаров в разделе.
 3. Для каждой карточки извлекается изображение и выполняется поиск в TinEye.
 4. Это программный эквивалент ручного пункта **Search image on TinEye** из контекстного меню браузера.
-5. В отчет попадают все найденные результаты TinEye (без фильтра только по стокам).
+5. В отчет попадают только ссылки, начинающиеся с `https://www.shutterstock.com`.
             """
         )
 
@@ -435,7 +466,31 @@ def main() -> None:
     )
 
     init_logs()
+    init_tineye_cookie_state()
     show_help()
+    render_semi_auto_help()
+
+    st.subheader("Сессия TinEye")
+    cookie_value = st.text_area(
+        "Cookie сессии TinEye",
+        value=st.session_state.get("tineye_cookie", ""),
+        height=120,
+        placeholder="cf_clearance=...; __cf_bm=...",
+        help="Вставьте Cookie после ручного прохождения проверки на сайте TinEye.",
+    )
+    cookie_col_apply, cookie_col_clear = st.columns([1, 1])
+    if cookie_col_apply.button("Применить Cookie", key="apply_cookie"):
+        st.session_state["tineye_cookie"] = cookie_value.strip()
+        tineye_client.apply_cookie_header(st.session_state["tineye_cookie"])
+        append_log("Cookie TinEye применена к HTTP-сессии")
+    if cookie_col_clear.button("Очистить Cookie", key="clear_cookie"):
+        st.session_state["tineye_cookie"] = ""
+        tineye_client.apply_cookie_header("")
+        append_log("Cookie TinEye очищена")
+
+    # Пояснение: на каждый рендер синхронизируем cookie из session_state в HTTP-сессию клиента.
+    tineye_client.apply_cookie_header(st.session_state.get("tineye_cookie", ""))
+    render_cookie_status()
 
     st.subheader("Логи обработки")
     log_placeholder = st.empty()

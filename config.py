@@ -55,7 +55,14 @@ def read_secret_or_env(key: str, default: str = "") -> str:
     # а для локального запуска — из переменных окружения.
     import os
 
-    value = st.secrets.get(key, "") if hasattr(st, "secrets") else ""
+    value = ""
+    if hasattr(st, "secrets"):
+        try:
+            value = st.secrets.get(key, "")
+        except Exception:
+            # Пояснение: в локальном окружении secrets.toml может отсутствовать —
+            # это штатный сценарий, поэтому тихо переключаемся на env/default.
+            value = ""
     if value:
         return str(value)
     return os.getenv(key, default)
