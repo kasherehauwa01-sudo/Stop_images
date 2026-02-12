@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -29,12 +29,18 @@ class TinEyeScraperClient:
     def is_configured(self) -> bool:
         return bool(self.settings.base_url)
 
+    def build_search_url(self, image_url: str) -> str:
+        return f"{self.settings.base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
+
     def search_by_url(self, image_url: str, top_n: int = 20) -> List[Dict[str, str]]:
-        # Пояснение: передаем URL изображения в поле Search by image url.
-        search_url = self.settings.base_url.rstrip("/") + "/search"
+        # Пояснение: строим URL для поля "Search by image url" и парсим именно эту страницу результатов.
+        request_url = self.build_search_url(image_url)
+        return self.search_by_tineye_url(request_url, top_n=top_n)
+
+    def search_by_tineye_url(self, request_url: str, top_n: int = 20) -> List[Dict[str, str]]:
+        # Пояснение: отдельный метод для явного парсинга уже сформированного TinEye URL из UI.
         response = self.session.get(
-            search_url,
-            params={"url": image_url},
+            request_url,
             timeout=self.settings.timeout_seconds,
             allow_redirects=True,
         )
@@ -58,23 +64,26 @@ class TinEyeScraperClient:
                 if c_parsed.scheme in {"http", "https"}:
                     return candidate
 
-        # Пояснение: иногда целевая ссылка лежит в JS-обработчиках.
         js_match = re.search(r"https?://[^'\"\s)]+", raw_href)
         if js_match:
             return js_match.group(0)
 
         return None
 
-    def _extract_domain_from_text(self, text: str) -> Optional[str]:
+    def _extract_domains_from_text(self, text: str) -> List[str]:
         if not text:
-            return None
-        m = re.search(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", text.lower())
-        if not m:
-            return None
-        domain = m.group(1).strip(".")
-        if domain.endswith("tineye.com"):
-            return None
-        return domain
+            return []
+        matches = re.findall(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", text.lower())
+        out: List[str] = []
+        seen = set()
+        for domain in matches:
+            domain = domain.strip(".")
+            if domain.endswith("tineye.com"):
+                continue
+            if domain not in seen:
+                seen.add(domain)
+                out.append(domain)
+        return out
 
     def _parse_results(self, html: str, final_url: str, top_n: int) -> List[Dict[str, str]]:
         soup = BeautifulSoup(html, "html.parser")
@@ -100,16 +109,24 @@ class TinEyeScraperClient:
             "a[href]",
         ]
 
+        # 1) Явные ссылки/атрибуты
         for selector in selectors:
             for node in soup.select(selector):
                 href = (node.get("href") or node.get("data-href") or "").strip()
                 ext_url = self._extract_external_url(href, final_url)
                 if ext_url:
                     push(ext_url, node.get_text(" ", strip=True))
+                # Доп. извлечение из dataset-атрибутов
+                for attr in ("data-url", "data-link", "data-target", "data-domain"):
+                    value = (node.get(attr) or "").strip()
+                    if value.startswith("http"):
+                        push(value, node.get_text(" ", strip=True))
+                    elif value and "." in value and " " not in value:
+                        push(f"https://{value}", node.get_text(" ", strip=True))
                 if len(normalized) >= top_n:
                     return normalized[:top_n]
 
-        # Пояснение: fallback №1 — ищем абсолютные URL прямо в скриптах страницы.
+        # 2) URL в скриптах
         for script in soup.find_all("script"):
             text = script.string or script.get_text() or ""
             for url in re.findall(r"https?://[^'\"\s<>()]+", text):
@@ -119,15 +136,14 @@ class TinEyeScraperClient:
                 if len(normalized) >= top_n:
                     return normalized[:top_n]
 
-        # Пояснение: fallback №2 — если есть домен в текстовом блоке результата,
-        # формируем URL вида https://domain.
-        card_selectors = [".match", ".result", "li", "article", ".results > div", "body"]
+        # 3) Домены в тексте карточек
+        card_selectors = [".match", ".result", "li", "article", "[class*='result']", "body"]
         for selector in card_selectors:
             for node in soup.select(selector):
-                domain = self._extract_domain_from_text(node.get_text(" ", strip=True))
-                if domain:
-                    push(f"https://{domain}", node.get_text(" ", strip=True))
-                if len(normalized) >= top_n:
-                    return normalized[:top_n]
+                text = node.get_text(" ", strip=True)
+                for domain in self._extract_domains_from_text(text):
+                    push(f"https://{domain}", text)
+                    if len(normalized) >= top_n:
+                        return normalized[:top_n]
 
         return normalized[:top_n]

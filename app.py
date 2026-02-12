@@ -280,7 +280,7 @@ def show_help() -> None:
 2. Приложение скрапит карточки товаров в разделе.
 3. Для каждой карточки извлекается изображение и выполняется поиск в TinEye.
 4. Это программный эквивалент ручного пункта **Search image on TinEye** из контекстного меню браузера.
-5. В отчет попадают только совпадения на доменах из `stocks_config.json`.
+5. В отчет попадают все найденные результаты TinEye (без фильтра только по стокам).
             """
         )
 
@@ -324,10 +324,10 @@ def process_batch(
             cached = storage.get_cached_results(image_hash)
             if cached is None:
                 append_log(f"TinEye url-запрос с извлеченным image_url: {image_url}")
-                tineye_request_url = build_tineye_search_url(tineye_client.settings.base_url, image_url)
+                tineye_request_url = tineye_client.build_search_url(image_url)
                 render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
                 # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не URL карточки.
-                tineye_results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
+                tineye_results = tineye_client.search_by_tineye_url(tineye_request_url, top_n=DEFAULT_TOP_N)
                 storage.set_cached_results(image_hash, tineye_results)
                 append_log(f"Кэш сохранен: {image_hash[:12]}")
             else:
@@ -393,10 +393,10 @@ def check_single_url(
     cached = storage.get_cached_results(image_hash)
     if cached is None:
         append_log(f"TinEye url-запрос для одиночной проверки с image_url: {image_url}")
-        tineye_request_url = build_tineye_search_url(tineye_client.settings.base_url, image_url)
+        tineye_request_url = tineye_client.build_search_url(image_url)
         render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
         # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не исходный URL страницы.
-        results = tineye_client.search_by_url(image_url, top_n=DEFAULT_TOP_N)
+        results = tineye_client.search_by_tineye_url(tineye_request_url, top_n=DEFAULT_TOP_N)
         storage.set_cached_results(image_hash, results)
     else:
         append_log(f"Одиночная проверка: использован кэш {image_hash[:12]}")
