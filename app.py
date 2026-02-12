@@ -3,23 +3,22 @@ from __future__ import annotations
 import json
 import re
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, urlparse
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
 from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns
 
 TIMEOUT_SECONDS = 20
 REPORT_CHUNK_SIZE = 50
-USER_AGENT = "Mozilla/5.0 StopImages/3.1"
+USER_AGENT = "Mozilla/5.0 StopImages/4.0"
 
-
-# Пояснение: признаки технических изображений, которые не нужно использовать как главное фото товара.
+# Пояснение: признаки технических изображений, которые нужно исключать.
 TECH_IMAGE_HINTS = [
     "icon",
     "sprite",
@@ -32,81 +31,314 @@ TECH_IMAGE_HINTS = [
     "thumb",
     "thumbnail",
     "loading",
+    "pixel",
 ]
 
+# Пояснение: признаки товарных ссылок.
+PRODUCT_PATH_HINTS = ["/catalog/", "/product/", "/item/"]
 
-# Пояснение: фразы для определения наличия товара.
+# Пояснение: признаки нерелевантных блоков (рекомендации/слайдеры/баннеры).
+NON_CATALOG_BLOCK_HINTS = ["recommend", "related", "similar", "slider", "carousel", "banner"]
+
 IN_STOCK_HINTS = ["в наличии", "есть в наличии", "in stock", "добавить в корзину", "купить"]
 OUT_OF_STOCK_HINTS = ["нет в наличии", "под заказ", "ожидается", "out of stock", "нет на складе"]
 
 
+class HttpClient:
+    # Пояснение: клиент с кэшированием HTML/HEAD-запросов и нормальными заголовками.
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT})
+        self.page_cache: Dict[str, Dict[str, str]] = {}
+        self.head_cache: Dict[str, Dict[str, str]] = {}
+
+    def get_page(self, url: str, referer: str = "") -> Dict[str, str]:
+        cache_key = f"GET::{url}::{referer}"
+        if cache_key in self.page_cache:
+            return self.page_cache[cache_key]
+
+        headers = {"Referer": referer} if referer else None
+        resp = self.session.get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code} для {url}")
+
+        payload = {
+            "source_url": url,
+            "final_url": resp.url,
+            "status_code": str(resp.status_code),
+            "content_type": resp.headers.get("content-type", ""),
+            "html": resp.text,
+        }
+        self.page_cache[cache_key] = payload
+        return payload
+
+    def head_or_get_image(self, image_url: str, referer: str = "") -> Dict[str, str]:
+        cache_key = f"HEAD::{image_url}::{referer}"
+        if cache_key in self.head_cache:
+            return self.head_cache[cache_key]
+
+        headers = {"Referer": referer} if referer else None
+        try:
+            resp = self.session.head(image_url, timeout=10, allow_redirects=True, headers=headers)
+            ct = resp.headers.get("content-type", "")
+            status = resp.status_code
+            if status == 403 and not referer:
+                # Пояснение: если CDN режет доступ, повторяем с Referer домена.
+                resp = self.session.head(
+                    image_url,
+                    timeout=10,
+                    allow_redirects=True,
+                    headers={"Referer": f"{urlparse(image_url).scheme}://{urlparse(image_url).netloc}"},
+                )
+                ct = resp.headers.get("content-type", "")
+                status = resp.status_code
+        except Exception:
+            resp = self.session.get(image_url, timeout=10, stream=True, allow_redirects=True, headers=headers)
+            status = resp.status_code
+            ct = resp.headers.get("content-type", "")
+
+        payload = {"status_code": str(status), "content_type": ct}
+        self.head_cache[cache_key] = payload
+        return payload
+
+
 def append_log(message: str) -> None:
-    # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки.
     st.session_state.setdefault("ui_logs", [])
-    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-700:]
+    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-900:]
 
 
 def render_logs(placeholder=None) -> None:
     logs = st.session_state.get("ui_logs", [])
     if placeholder is None:
         return
-    placeholder.code("\n".join(logs[-250:]) if logs else "Логи пока отсутствуют.", language="text")
+    placeholder.code("\n".join(logs[-300:]) if logs else "Логи пока отсутствуют.", language="text")
 
 
 def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com") -> str:
-    # Пояснение: формируем URL для сценария "Search by image url".
     return f"{base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
 
 
-def scrape_product_links_from_section(section_url: str) -> List[str]:
-    # Пояснение: собираем ссылки карточек товаров из раздела.
-    headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(section_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
-    resp.raise_for_status()
+def normalize_product_url(url: str) -> str:
+    # Пояснение: нормализуем URL товара, чтобы дедупликация была стабильной.
+    parsed = urlparse(url)
+    clean_path = re.sub(r"/+", "/", parsed.path).rstrip("/")
+    return urlunparse((parsed.scheme, parsed.netloc.lower(), clean_path, "", "", ""))
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    base_host = urlparse(section_url).netloc.lower()
 
-    selectors = [
-        "a.product-item-link[href]",
-        "a.product-card[href]",
-        "a.catalog-item[href]",
-        "div.product-item a[href]",
-        "article a[href]",
-        "a[href]",
-    ]
+def pick_biggest_from_srcset(srcset: str, base_url: str) -> str:
+    # Пояснение: из srcset выбираем кандидат с максимальной шириной.
+    best_url = ""
+    best_width = -1
+    for part in srcset.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        bits = item.split()
+        cand = urljoin(base_url, bits[0])
+        width = 0
+        if len(bits) > 1 and bits[1].endswith("w"):
+            try:
+                width = int(bits[1][:-1])
+            except Exception:
+                width = 0
+        if width > best_width:
+            best_width = width
+            best_url = cand
+    return best_url
 
-    links: List[str] = []
-    seen = set()
-    for selector in selectors:
-        for a in soup.select(selector):
-            href = (a.get("href") or "").strip()
-            if not href or href.startswith("#"):
+
+def extract_preview_from_card(card: Tag, page_url: str) -> str:
+    # Пояснение: извлекаем превью товара из src/data-src/srcset/style.
+    img = card.select_one("img")
+    if img:
+        srcset = (img.get("srcset") or "").strip()
+        if srcset:
+            cand = pick_biggest_from_srcset(srcset, page_url)
+            if cand:
+                return cand
+
+        for key in ["data-src", "data-original", "src"]:
+            raw = (img.get(key) or "").strip()
+            if raw:
+                return urljoin(page_url, raw)
+
+    style_node = card.select_one("[style*='background-image']")
+    if style_node:
+        style = style_node.get("style", "")
+        m = re.search(r"background-image\s*:\s*url\((['\"]?)(.*?)\1\)", style)
+        if m:
+            return urljoin(page_url, m.group(2))
+
+    return ""
+
+
+def looks_like_product_link(href: str) -> bool:
+    lower = href.lower()
+    return any(h in lower for h in PRODUCT_PATH_HINTS)
+
+
+def container_signature(tag: Optional[Tag]) -> str:
+    # Пояснение: подпись контейнера для поиска самого повторяющегося блока карточки.
+    if tag is None:
+        return ""
+    classes = sorted(tag.get("class", []))[:3]
+    ident = tag.get("id", "")
+    return f"{tag.name}|{' '.join(classes)}|{ident}"
+
+
+def find_best_container_for_link(link: Tag) -> Optional[Tag]:
+    # Пояснение: ищем ближайший контейнер карточки вокруг ссылки на товар.
+    current: Optional[Tag] = link
+    for _ in range(6):
+        if current is None or not isinstance(current, Tag):
+            return None
+        if current.name in {"article", "li", "div"}:
+            classes = " ".join(current.get("class", [])).lower()
+            if any(h in classes for h in NON_CATALOG_BLOCK_HINTS):
+                return None
+            if current.find("img") and (current.find(text=True) or current.select_one("[class*='price']")):
+                return current
+        current = current.parent if isinstance(current.parent, Tag) else None
+    return None
+
+
+def extract_name_from_card(card: Tag, link: Tag) -> str:
+    # Пояснение: название берем из заголовков внутри карточки или текста ссылки.
+    for sel in ["h1", "h2", "h3", "h4", ".name", ".title", "[itemprop='name']"]:
+        n = card.select_one(sel)
+        if n:
+            txt = n.get_text(" ", strip=True)
+            if txt:
+                return txt
+    return link.get_text(" ", strip=True)
+
+
+def collect_product_cards_from_html(html: str, page_url: str, base_host: str) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    link_candidates: List[Tuple[Tag, Tag, str]] = []
+    signature_count: Dict[str, int] = {}
+
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#"):
+            continue
+        full = urljoin(page_url, href)
+        parsed = urlparse(full)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if parsed.netloc.lower() != base_host:
+            continue
+        if not looks_like_product_link(parsed.path):
+            continue
+
+        card = find_best_container_for_link(a)
+        if card is None:
+            continue
+
+        sig = container_signature(card)
+        signature_count[sig] = signature_count.get(sig, 0) + 1
+        link_candidates.append((card, a, full))
+
+    if not signature_count:
+        return []
+
+    # Пояснение: выбираем самый частый повторяющийся контейнер как селектор карточки.
+    best_signature = max(signature_count.items(), key=lambda x: x[1])[0]
+
+    products: List[Dict[str, str]] = []
+    for card, a, full in link_candidates:
+        if container_signature(card) != best_signature:
+            continue
+
+        product_url = normalize_product_url(full)
+        name = extract_name_from_card(card, a)
+        preview_url = extract_preview_from_card(card, page_url)
+        products.append({
+            "name": name,
+            "product_url": product_url,
+            "preview_url": preview_url,
+        })
+
+    return products
+
+
+def discover_pagination_urls(html: str, page_url: str, base_host: str) -> List[str]:
+    # Пояснение: ищем ссылки пагинации (страницы 2,3,...) и URL с параметрами page/PAGEN.
+    soup = BeautifulSoup(html, "html.parser")
+    urls: Set[str] = set()
+
+    for a in soup.select("a[href]"):
+        text = a.get_text(" ", strip=True)
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = urljoin(page_url, href)
+        parsed = urlparse(full)
+        if parsed.netloc.lower() != base_host:
+            continue
+
+        query = parse_qs(parsed.query)
+        has_page_param = any(k.lower().startswith("pagen_") or k.lower() in {"page", "p"} for k in query.keys())
+        is_digit_link = text.isdigit() and int(text) >= 2
+        if has_page_param or is_digit_link:
+            urls.add(full)
+
+    return sorted(urls)
+
+
+def scrape_products_from_section(section_url: str, client: HttpClient, max_pages: int = 50) -> List[Dict[str, str]]:
+    # Пояснение: проход по категории с поддержкой пагинации и остановками по отсутствию новых товаров.
+    first_page = client.get_page(section_url)
+    base_host = urlparse(first_page["final_url"]).netloc.lower()
+
+    append_log(
+        f"Категория: source={first_page['source_url']} -> final={first_page['final_url']} | status={first_page['status_code']}"
+    )
+
+    queue: List[str] = [first_page["final_url"]]
+    seen_pages: Set[str] = set()
+    seen_products: Set[str] = set()
+    all_products: List[Dict[str, str]] = []
+
+    while queue and len(seen_pages) < max_pages:
+        page_url = queue.pop(0)
+        if page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
+
+        page = first_page if page_url == first_page["final_url"] else client.get_page(page_url)
+        products = collect_product_cards_from_html(page["html"], page["final_url"], base_host)
+
+        new_count = 0
+        for p in products:
+            if p["product_url"] in seen_products:
                 continue
-            full = urljoin(section_url, href)
-            parsed = urlparse(full)
-            if parsed.scheme not in {"http", "https"}:
-                continue
-            if parsed.netloc.lower() != base_host:
-                continue
-            if not any(token in parsed.path.lower() for token in ["/catalog/", "/product/", "/item/"]):
-                continue
-            if full not in seen:
-                seen.add(full)
-                links.append(full)
-    return links
+            seen_products.add(p["product_url"])
+            all_products.append(p)
+            new_count += 1
+
+        append_log(
+            f"Страница каталога: {page['final_url']} | карточек={len(products)} | новых={new_count}"
+        )
+
+        # Пояснение: если новых товаров нет, дальнейшая пагинация обычно бессмысленна.
+        if len(products) == 0 or new_count == 0:
+            continue
+
+        for nxt in discover_pagination_urls(page["html"], page["final_url"], base_host):
+            if nxt not in seen_pages and nxt not in queue:
+                queue.append(nxt)
+
+    return all_products
 
 
 def is_probably_technical_image(url: str, css_classes: str = "", alt_text: str = "") -> bool:
-    # Пояснение: фильтрация технических картинок, иконок и служебной графики.
     sample = f"{url} {css_classes} {alt_text}".lower()
     return any(hint in sample for hint in TECH_IMAGE_HINTS)
 
 
-
-
-def _looks_like_800x800(node, image_url: str) -> bool:
-    # Пояснение: целимся в основное фото карточки, которое часто имеет размер 800x800.
+def _looks_like_800x800(node: Tag, image_url: str) -> bool:
     sample = image_url.lower()
     if "800x800" in sample or "/800/800" in sample or "w=800" in sample:
         return True
@@ -118,69 +350,144 @@ def _looks_like_800x800(node, image_url: str) -> bool:
 
     data_w = str(node.get("data-width", "")).strip()
     data_h = str(node.get("data-height", "")).strip()
-    if data_w == "800" and data_h == "800":
-        return True
+    return data_w == "800" and data_h == "800"
 
-    return False
 
-def extract_main_product_image(soup: BeautifulSoup, product_url: str) -> Optional[str]:
-    # Пояснение: приоритетно берем фото из блока карточки
-    # product-detail-gallery__picture rounded3 zoom_picture lazyloaded.
+def _normalize_image_url(image_url: str, base_url: str) -> str:
+    # Пояснение: нормализация URL изображения + удаление трекинговых query-параметров.
+    abs_url = urljoin(base_url, image_url.strip())
+    p = urlparse(abs_url)
+    query = parse_qs(p.query)
+    keep = {}
+    for k, v in query.items():
+        lk = k.lower()
+        if lk.startswith("utm_") or lk in {"ysclid", "gclid", "fbclid"}:
+            continue
+        keep[k] = v
+    new_query = urlencode([(k, vv) for k, vals in keep.items() for vv in vals])
+    return urlunparse((p.scheme, p.netloc, p.path, "", new_query, ""))
+
+
+def _image_url_score(url: str) -> int:
+    # Пояснение: оценка релевантности картинки в fallback-режиме.
+    u = url.lower()
+    score = 0
+    if any(k in u for k in ["product", "catalog", "iblock"]):
+        score += 3
+    if any(k in u for k in ["800x800", "1200", "1000"]):
+        score += 2
+    if is_probably_technical_image(u):
+        score -= 5
+    return score
+
+
+def extract_main_image_from_product(soup: BeautifulSoup, product_url: str) -> Tuple[str, str]:
+    # Приоритет 1: og:image
+    og = soup.select_one("meta[property='og:image'][content]")
+    if og and og.get("content"):
+        return _normalize_image_url(og["content"], product_url), "og:image"
+
+    # Приоритет 2: JSON-LD Product.image
+    for script in soup.select("script[type='application/ld+json']"):
+        txt = (script.string or script.get_text() or "").strip()
+        if not txt:
+            continue
+        try:
+            payload = json.loads(txt)
+        except Exception:
+            continue
+
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                typ = str(item.get("@type", "")).lower()
+                image_val = item.get("image")
+                if typ == "product" and image_val:
+                    if isinstance(image_val, str):
+                        return _normalize_image_url(image_val, product_url), "jsonld"
+                    if isinstance(image_val, list) and image_val:
+                        first = next((x for x in image_val if isinstance(x, str) and x.strip()), "")
+                        if first:
+                            return _normalize_image_url(first, product_url), "jsonld"
+                for v in item.values():
+                    stack.append(v)
+            elif isinstance(item, list):
+                stack.extend(item)
+
+    # Приоритет 3: галерея, с акцентом на класс product-detail-gallery__picture...
+    gallery_candidates: List[Tuple[int, str]] = []
     strict_selector = "img.product-detail-gallery__picture.rounded3.zoom_picture.lazyloaded"
-    strict_candidates = []
     for node in soup.select(strict_selector):
-        raw = (node.get("src") or node.get("data-src") or node.get("data-original") or "").strip()
+        raw = (
+            node.get("data-zoom")
+            or node.get("data-large")
+            or node.get("data-src")
+            or node.get("src")
+            or ""
+        ).strip()
         if not raw:
             continue
-        full = urljoin(product_url, raw)
+        full = _normalize_image_url(raw, product_url)
         if is_probably_technical_image(full, " ".join(node.get("class", [])), node.get("alt", "")):
             continue
-        strict_candidates.append((node, full))
+        score = 100 + (20 if _looks_like_800x800(node, full) else 0)
+        gallery_candidates.append((score, full))
 
-    # Пояснение: если среди строгих кандидатов есть вариант 800x800 — берем его первым.
-    for node, full in strict_candidates:
-        if _looks_like_800x800(node, full):
-            return full
-    if strict_candidates:
-        return strict_candidates[0][1]
-
-    # Пояснение: fallback на другие селекторы карточки, если строгий класс не найден.
-    priority_selectors = [
-        "meta[property='og:image']",
-        "meta[name='twitter:image']",
-        "meta[itemprop='image']",
-        ".product-detail img[itemprop='image']",
-        ".product-main-image img",
-        ".product-gallery__main img",
+    gallery_selectors = [
+        ".product-detail-gallery a[href]",
+        ".product-detail-gallery img",
+        ".product-gallery a[href]",
         ".product-gallery img",
-        ".product-card__image img",
+        ".swiper img",
     ]
-
-    for selector in priority_selectors:
-        for node in soup.select(selector):
-            raw = (node.get("content") or node.get("src") or node.get("data-src") or "").strip()
+    for sel in gallery_selectors:
+        for node in soup.select(sel):
+            raw = (
+                node.get("data-zoom")
+                or node.get("data-large")
+                or node.get("data-src")
+                or node.get("src")
+                or node.get("href")
+                or ""
+            ).strip()
             if not raw:
                 continue
-            full = urljoin(product_url, raw)
+            full = _normalize_image_url(raw, product_url)
             if is_probably_technical_image(full, " ".join(node.get("class", [])), node.get("alt", "")):
                 continue
-            return full
+            score = 50 + _image_url_score(full)
+            gallery_candidates.append((score, full))
 
-    # Пояснение: последний fallback — первый нетехнический img, если явного главного селектора нет.
+    if gallery_candidates:
+        gallery_candidates.sort(key=lambda x: x[0], reverse=True)
+        return gallery_candidates[0][1], "gallery"
+
+    # Приоритет 4: fallback по всем изображениям
+    fallback: List[Tuple[int, str]] = []
     for img in soup.select("img"):
-        raw = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        raw = (img.get("data-src") or img.get("src") or "").strip()
         if not raw:
             continue
-        full = urljoin(product_url, raw)
+        full = _normalize_image_url(raw, product_url)
         if is_probably_technical_image(full, " ".join(img.get("class", [])), img.get("alt", "")):
             continue
-        return full
 
-    return None
+        w = int(str(img.get("width", "0")).strip() or "0") if str(img.get("width", "")).isdigit() else 0
+        h = int(str(img.get("height", "0")).strip() or "0") if str(img.get("height", "")).isdigit() else 0
+        if (w and w < 200) or (h and h < 200):
+            continue
+
+        fallback.append((_image_url_score(full), full))
+
+    if fallback:
+        fallback.sort(key=lambda x: x[0], reverse=True)
+        return fallback[0][1], "fallback"
+
+    raise ValueError("Не найдено главное изображение товара")
 
 
 def extract_article(soup: BeautifulSoup) -> str:
-    # Пояснение: артикул берем из мета-тегов или типовых блоков карточки.
     sku_meta = soup.find("meta", attrs={"property": "product:retailer_item_id"}) or soup.find(
         "meta", attrs={"name": "sku"}
     )
@@ -197,7 +504,6 @@ def extract_article(soup: BeautifulSoup) -> str:
 
 
 def _availability_from_json_ld(soup: BeautifulSoup) -> Optional[bool]:
-    # Пояснение: сначала пытаемся получить статус наличия из структурированных данных JSON-LD.
     for script in soup.select("script[type='application/ld+json']"):
         text = (script.string or script.get_text() or "").strip()
         if not text:
@@ -224,13 +530,13 @@ def _availability_from_json_ld(soup: BeautifulSoup) -> Optional[bool]:
 
 
 def is_product_in_stock(soup: BeautifulSoup) -> bool:
-    # Пояснение: проверяем наличие товара; только товары "в наличии" идут в обработку.
     availability_node = soup.select_one("link[itemprop='availability'], meta[itemprop='availability']")
-    if availability_node and availability_node.get("href"):
-        href = availability_node.get("href", "").lower()
-        if "instock" in href:
+    if availability_node:
+        href = str(availability_node.get("href", "")).lower()
+        content = str(availability_node.get("content", "")).lower()
+        if "instock" in href or "instock" in content:
             return True
-        if "outofstock" in href:
+        if "outofstock" in href or "outofstock" in content:
             return False
 
     json_ld_state = _availability_from_json_ld(soup)
@@ -244,35 +550,36 @@ def is_product_in_stock(soup: BeautifulSoup) -> bool:
         return True
 
     buy_btn = soup.select_one("button.add-to-cart, button.buy, .btn-buy, .to-cart")
-    if buy_btn and not buy_btn.has_attr("disabled"):
-        return True
-
-    return False
+    return bool(buy_btn and not buy_btn.has_attr("disabled"))
 
 
-def extract_product_data(product_url: str) -> Tuple[str, str, bool]:
-    # Пояснение: из карточки получаем артикул, главное изображение и статус наличия.
-    headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(product_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
+def extract_product_data(product: Dict[str, str], client: HttpClient) -> Dict[str, str]:
+    # Пояснение: полная обработка карточки по ТЗ с указанием источника главного изображения.
+    page = client.get_page(product["product_url"])
+    soup = BeautifulSoup(page["html"], "html.parser")
 
     article = extract_article(soup)
     in_stock = is_product_in_stock(soup)
-    image_url = extract_main_product_image(soup, product_url)
+    main_image_url, source = extract_main_image_from_product(soup, page["final_url"])
 
-    if not image_url:
-        raise ValueError("Не найдено главное изображение товара")
+    head_info = client.head_or_get_image(main_image_url, referer=f"{urlparse(page['final_url']).scheme}://{urlparse(page['final_url']).netloc}")
+    if "image" not in head_info.get("content_type", "").lower() and not re.search(r"\.(jpg|jpeg|png|webp|gif|bmp|avif|svg)(\?|$)", main_image_url, re.I):
+        append_log(f"WARN: возможно не image URL: {main_image_url} | content-type={head_info.get('content_type', '')}")
 
-    return article, image_url, in_stock
+    return {
+        "product_url": page["final_url"],
+        "name": product.get("name", ""),
+        "preview_url": product.get("preview_url", ""),
+        "article": article,
+        "in_stock": "1" if in_stock else "0",
+        "main_image_url": main_image_url,
+        "main_image_source": source,
+    }
 
 
 def get_second_level_category_name(section_url: str) -> str:
-    # Пояснение: имя файла формируется по категории 2-го уровня URL раздела.
     parts = [p for p in urlparse(section_url).path.split("/") if p]
     category = "report"
-
     if "catalog" in parts:
         idx = parts.index("catalog")
         if len(parts) > idx + 2:
@@ -293,7 +600,6 @@ def split_records(records: List[Dict[str, str]], chunk_size: int = REPORT_CHUNK_
 
 
 def build_zip_with_reports(files_payload: List[Tuple[str, bytes]]) -> bytes:
-    # Пояснение: при нескольких отчетах отдаем один ZIP.
     buf = BytesIO()
     with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
         for filename, payload in files_payload:
@@ -308,6 +614,7 @@ def process_sections(section_urls: List[str], log_placeholder):
     total_skipped_not_in_stock = 0
     total_errors = 0
 
+    client = HttpClient()
     progress = st.progress(0.0)
     total_sections = len(section_urls)
 
@@ -316,18 +623,17 @@ def process_sections(section_urls: List[str], log_placeholder):
         render_logs(log_placeholder)
 
         try:
-            product_links = scrape_product_links_from_section(section_url)
-            append_log(f"Найдено карточек в разделе: {len(product_links)}")
-            render_logs(log_placeholder)
+            products = scrape_products_from_section(section_url, client)
+            append_log(f"Итого уникальных карточек в категории: {len(products)}")
         except Exception as exc:
             total_errors += 1
-            append_log(f"Ошибка парсинга раздела: {exc}")
+            append_log(f"Ошибка парсинга категории: {exc}")
             render_logs(log_placeholder)
             progress.progress(section_idx / max(1, total_sections))
             continue
 
         section_rows: List[Dict[str, str]] = []
-        for product_url in product_links:
+        for product in products:
             if st.session_state.get("stop_requested", False):
                 append_log("Получена команда СТОП. Останавливаем обработку после текущего шага.")
                 render_logs(log_placeholder)
@@ -335,27 +641,28 @@ def process_sections(section_urls: List[str], log_placeholder):
 
             total_checked += 1
             try:
-                article, image_url, in_stock = extract_product_data(product_url)
-
-                if not in_stock:
+                item = extract_product_data(product, client)
+                if item["in_stock"] != "1":
                     total_skipped_not_in_stock += 1
-                    append_log(f"Пропущено (нет в наличии): {product_url}")
+                    append_log(f"Пропущено (нет в наличии): {item['product_url']}")
                     render_logs(log_placeholder)
                     continue
 
                 total_in_stock += 1
-                tineye_url = build_tineye_search_url(image_url)
+                tineye_url = build_tineye_search_url(item["main_image_url"])
                 section_rows.append(
                     {
-                        "Артикул": article,
-                        "Ссылка на сайт": product_url,
+                        "Артикул": item["article"],
+                        "Ссылка на сайт": item["product_url"],
                         "TinEye URL запроса": tineye_url,
                     }
                 )
-                append_log(f"OK (в наличии): {product_url} | Главное изображение: {image_url}")
+                append_log(
+                    f"OK (в наличии): {item['product_url']} | image_source={item['main_image_source']}"
+                )
             except Exception as exc:
                 total_errors += 1
-                append_log(f"Ошибка карточки {product_url}: {exc}")
+                append_log(f"Ошибка карточки {product['product_url']}: {exc}")
             render_logs(log_placeholder)
 
         chunks = split_records(section_rows, REPORT_CHUNK_SIZE)
@@ -365,9 +672,7 @@ def process_sections(section_urls: List[str], log_placeholder):
             filename = f"{category_name}{file_suffix}.xlsx"
             all_report_files.append((filename, build_report(chunk_rows)))
 
-        append_log(
-            f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии"
-        )
+        append_log(f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии")
         render_logs(log_placeholder)
         progress.progress(section_idx / max(1, total_sections))
 
@@ -392,11 +697,9 @@ def main() -> None:
     st.markdown(
         """
 - На вход подается ссылка на раздел сайта (или XLS/XLSX со ссылками разделов).
-- Приложение обходит карточки товаров в разделе.
-- Берет **только товары в наличии**.
-- Из карточки берет **главное изображение товара** (иконки/технические картинки фильтруются).
-- В отчет записывается: **Артикул**, **Ссылка на сайт**, **TinEye URL запроса**.
-- Если строк больше 50, отчет делится на файлы по 50 строк.
+- Выполняется парсинг категории с дедупликацией карточек и учетом пагинации.
+- Для карточки ищется главное изображение по приоритетам: og:image → jsonld → gallery → fallback.
+- В отчет попадают только товары в наличии.
         """
     )
 
@@ -436,7 +739,6 @@ def main() -> None:
             if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
                 source_df = make_rows_from_excel(df_raw, mapping_confirmed)
 
-    # Пояснение: кнопки управления размещены под полем ввода URL разделов.
     ctrl_col1, ctrl_col2 = st.columns([1, 1])
     with ctrl_col1:
         run = st.button("Сформировать отчеты", type="primary")
@@ -462,8 +764,6 @@ def main() -> None:
     files_payload: List[Tuple[str, bytes]] = []
     stats = None
 
-    log_placeholder = None
-
     if run:
         st.session_state["ui_logs"] = []
         st.session_state["stop_requested"] = False
@@ -473,7 +773,7 @@ def main() -> None:
             st.warning("Нет ссылок разделов для обработки.")
             return
 
-        files_payload, stats = process_sections(section_urls, log_placeholder)
+        files_payload, stats = process_sections(section_urls, None)
 
     if stats is not None:
         st.success(
@@ -506,10 +806,10 @@ def main() -> None:
                 for filename, _ in files_payload:
                     st.write(filename)
 
-    # Пояснение: логи отображаются внизу интерфейса.
     st.subheader("Логи обработки")
     bottom_log_placeholder = st.empty()
     render_logs(bottom_log_placeholder)
+
 
 if __name__ == "__main__":
     main()
