@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
-import streamlit as st
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
 
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
@@ -15,17 +16,39 @@ from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns
 
 TIMEOUT_SECONDS = 20
 REPORT_CHUNK_SIZE = 50
+USER_AGENT = "Mozilla/5.0 StopImages/3.1"
+
+
+# Пояснение: признаки технических изображений, которые не нужно использовать как главное фото товара.
+TECH_IMAGE_HINTS = [
+    "icon",
+    "sprite",
+    "logo",
+    "placeholder",
+    "favicon",
+    "badge",
+    "payment",
+    "delivery",
+    "thumb",
+    "thumbnail",
+    "loading",
+]
+
+
+# Пояснение: фразы для определения наличия товара.
+IN_STOCK_HINTS = ["в наличии", "есть в наличии", "in stock", "добавить в корзину", "купить"]
+OUT_OF_STOCK_HINTS = ["нет в наличии", "под заказ", "ожидается", "out of stock", "нет на складе"]
 
 
 def append_log(message: str) -> None:
-    # Пояснение: собираем лог-строки в session_state, чтобы отображать их прямо в интерфейсе.
+    # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки.
     st.session_state.setdefault("ui_logs", [])
-    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-500:]
+    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-700:]
 
 
 def render_logs(placeholder) -> None:
     logs = st.session_state.get("ui_logs", [])
-    placeholder.code("\n".join(logs[-200:]) if logs else "Логи пока отсутствуют.", language="text")
+    placeholder.code("\n".join(logs[-250:]) if logs else "Логи пока отсутствуют.", language="text")
 
 
 def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com") -> str:
@@ -34,8 +57,8 @@ def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com"
 
 
 def scrape_product_links_from_section(section_url: str) -> List[str]:
-    # Пояснение: из страницы категории собираем ссылки карточек товаров.
-    headers = {"User-Agent": "Mozilla/5.0 StopImages/3.0"}
+    # Пояснение: собираем ссылки карточек товаров из раздела.
+    headers = {"User-Agent": USER_AGENT}
     resp = requests.get(section_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
     resp.raise_for_status()
 
@@ -72,61 +95,139 @@ def scrape_product_links_from_section(section_url: str) -> List[str]:
     return links
 
 
-def _extract_product_image_candidates(soup: BeautifulSoup, product_url: str) -> List[str]:
-    # Пояснение: собираем возможные URL изображения из мета-тегов и HTML карточки.
-    candidates: List[str] = []
+def is_probably_technical_image(url: str, css_classes: str = "", alt_text: str = "") -> bool:
+    # Пояснение: фильтрация технических картинок, иконок и служебной графики.
+    sample = f"{url} {css_classes} {alt_text}".lower()
+    return any(hint in sample for hint in TECH_IMAGE_HINTS)
 
-    for selector in ["meta[property='og:image']", "meta[name='twitter:image']", "meta[itemprop='image']"]:
-        node = soup.select_one(selector)
-        if node and node.get("content"):
-            candidates.append(urljoin(product_url, node.get("content", "").strip()))
 
+def extract_main_product_image(soup: BeautifulSoup, product_url: str) -> Optional[str]:
+    # Пояснение: берем именно главное изображение карточки, а не все картинки страницы.
+    priority_selectors = [
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+        "meta[itemprop='image']",
+        ".product-detail img[itemprop='image']",
+        ".product-main-image img",
+        ".product-gallery__main img",
+        ".product-gallery img",
+        ".product-card__image img",
+    ]
+
+    for selector in priority_selectors:
+        for node in soup.select(selector):
+            raw = (node.get("content") or node.get("src") or node.get("data-src") or "").strip()
+            if not raw:
+                continue
+            full = urljoin(product_url, raw)
+            if is_probably_technical_image(full, " ".join(node.get("class", [])), node.get("alt", "")):
+                continue
+            return full
+
+    # Пояснение: fallback — первый нетехнический img, если явного главного селектора нет.
     for img in soup.select("img"):
-        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
-        if src:
-            candidates.append(urljoin(product_url, src))
+        raw = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        if not raw:
+            continue
+        full = urljoin(product_url, raw)
+        if is_probably_technical_image(full, " ".join(img.get("class", [])), img.get("alt", "")):
+            continue
+        return full
 
-    unique: List[str] = []
-    seen = set()
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return unique
+    return None
 
 
-def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, str]:
-    # Пояснение: для отчета берем артикул из карточки и URL изображения для TinEye-ссылки.
-    headers = {"User-Agent": "Mozilla/5.0 StopImages/3.0"}
+def extract_article(soup: BeautifulSoup) -> str:
+    # Пояснение: артикул берем из мета-тегов или типовых блоков карточки.
+    sku_meta = soup.find("meta", attrs={"property": "product:retailer_item_id"}) or soup.find(
+        "meta", attrs={"name": "sku"}
+    )
+    if sku_meta and sku_meta.get("content"):
+        return sku_meta.get("content", "").strip()
+
+    for selector in ["[itemprop='sku']", ".sku", "#sku", "[data-sku]", ".product-sku", ".article", "#article"]:
+        node = soup.select_one(selector)
+        if node:
+            val = (node.get("data-sku") or node.get_text(" ", strip=True) or "").strip()
+            if val:
+                return val
+    return ""
+
+
+def _availability_from_json_ld(soup: BeautifulSoup) -> Optional[bool]:
+    # Пояснение: сначала пытаемся получить статус наличия из структурированных данных JSON-LD.
+    for script in soup.select("script[type='application/ld+json']"):
+        text = (script.string or script.get_text() or "").strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                availability = str(item.get("availability", "")).lower()
+                if "instock" in availability:
+                    return True
+                if "outofstock" in availability:
+                    return False
+                for v in item.values():
+                    stack.append(v)
+            elif isinstance(item, list):
+                stack.extend(item)
+    return None
+
+
+def is_product_in_stock(soup: BeautifulSoup) -> bool:
+    # Пояснение: проверяем наличие товара; только товары "в наличии" идут в обработку.
+    availability_node = soup.select_one("link[itemprop='availability'], meta[itemprop='availability']")
+    if availability_node and availability_node.get("href"):
+        href = availability_node.get("href", "").lower()
+        if "instock" in href:
+            return True
+        if "outofstock" in href:
+            return False
+
+    json_ld_state = _availability_from_json_ld(soup)
+    if json_ld_state is not None:
+        return json_ld_state
+
+    text = soup.get_text(" ", strip=True).lower()
+    if any(neg in text for neg in OUT_OF_STOCK_HINTS):
+        return False
+    if any(pos in text for pos in IN_STOCK_HINTS):
+        return True
+
+    buy_btn = soup.select_one("button.add-to-cart, button.buy, .btn-buy, .to-cart")
+    if buy_btn and not buy_btn.has_attr("disabled"):
+        return True
+
+    return False
+
+
+def extract_product_data(product_url: str) -> Tuple[str, str, bool]:
+    # Пояснение: из карточки получаем артикул, главное изображение и статус наличия.
+    headers = {"User-Agent": USER_AGENT}
     resp = requests.get(product_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    article = ""
-    sku_meta = soup.find("meta", attrs={"property": "product:retailer_item_id"}) or soup.find(
-        "meta", attrs={"name": "sku"}
-    )
-    if sku_meta and sku_meta.get("content"):
-        article = sku_meta.get("content", "").strip()
+    article = extract_article(soup)
+    in_stock = is_product_in_stock(soup)
+    image_url = extract_main_product_image(soup, product_url)
 
-    if not article:
-        for selector in ["[itemprop='sku']", ".sku", "#sku", "[data-sku]", ".product-sku", ".article", "#article"]:
-            node = soup.select_one(selector)
-            if node:
-                article = (node.get("data-sku") or node.get_text(" ", strip=True) or "").strip()
-                if article:
-                    break
+    if not image_url:
+        raise ValueError("Не найдено главное изображение товара")
 
-    image_candidates = _extract_product_image_candidates(soup, product_url)
-    if not image_candidates:
-        raise ValueError("Не найдено изображение в карточке товара")
-
-    return article, image_candidates[0]
+    return article, image_url, in_stock
 
 
 def get_second_level_category_name(section_url: str) -> str:
-    # Пояснение: имя файла строим из категории 2-го уровня URL раздела.
+    # Пояснение: имя файла формируется по категории 2-го уровня URL раздела.
     parts = [p for p in urlparse(section_url).path.split("/") if p]
     category = "report"
 
@@ -150,7 +251,7 @@ def split_records(records: List[Dict[str, str]], chunk_size: int = REPORT_CHUNK_
 
 
 def build_zip_with_reports(files_payload: List[Tuple[str, bytes]]) -> bytes:
-    # Пояснение: если отчетов несколько, отдаем одним ZIP-архивом.
+    # Пояснение: при нескольких отчетах отдаем один ZIP.
     buf = BytesIO()
     with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
         for filename, payload in files_payload:
@@ -160,7 +261,9 @@ def build_zip_with_reports(files_payload: List[Tuple[str, bytes]]) -> bytes:
 
 def process_sections(section_urls: List[str], log_placeholder):
     all_report_files: List[Tuple[str, bytes]] = []
-    total_products = 0
+    total_checked = 0
+    total_in_stock = 0
+    total_skipped_not_in_stock = 0
     total_errors = 0
 
     progress = st.progress(0.0)
@@ -172,7 +275,7 @@ def process_sections(section_urls: List[str], log_placeholder):
 
         try:
             product_links = scrape_product_links_from_section(section_url)
-            append_log(f"Найдено карточек: {len(product_links)}")
+            append_log(f"Найдено карточек в разделе: {len(product_links)}")
             render_logs(log_placeholder)
         except Exception as exc:
             total_errors += 1
@@ -183,8 +286,22 @@ def process_sections(section_urls: List[str], log_placeholder):
 
         section_rows: List[Dict[str, str]] = []
         for product_url in product_links:
+            if st.session_state.get("stop_requested", False):
+                append_log("Получена команда СТОП. Останавливаем обработку после текущего шага.")
+                render_logs(log_placeholder)
+                break
+
+            total_checked += 1
             try:
-                article, image_url = extract_article_and_image_from_product_page(product_url)
+                article, image_url, in_stock = extract_product_data(product_url)
+
+                if not in_stock:
+                    total_skipped_not_in_stock += 1
+                    append_log(f"Пропущено (нет в наличии): {product_url}")
+                    render_logs(log_placeholder)
+                    continue
+
+                total_in_stock += 1
                 tineye_url = build_tineye_search_url(image_url)
                 section_rows.append(
                     {
@@ -193,8 +310,7 @@ def process_sections(section_urls: List[str], log_placeholder):
                         "TinEye URL запроса": tineye_url,
                     }
                 )
-                total_products += 1
-                append_log(f"Подготовлен TinEye URL: {tineye_url}")
+                append_log(f"OK (в наличии): {product_url} | Главное изображение: {image_url}")
             except Exception as exc:
                 total_errors += 1
                 append_log(f"Ошибка карточки {product_url}: {exc}")
@@ -208,14 +324,19 @@ def process_sections(section_urls: List[str], log_placeholder):
             all_report_files.append((filename, build_report(chunk_rows)))
 
         append_log(
-            f"Сформировано файлов по разделу: {len(chunks)} (размер каждого до {REPORT_CHUNK_SIZE} строк)"
+            f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии"
         )
         render_logs(log_placeholder)
         progress.progress(section_idx / max(1, total_sections))
 
+        if st.session_state.get("stop_requested", False):
+            break
+
     stats = {
         "sections": len(section_urls),
-        "products": total_products,
+        "checked": total_checked,
+        "in_stock": total_in_stock,
+        "skipped_not_in_stock": total_skipped_not_in_stock,
         "errors": total_errors,
         "files": len(all_report_files),
     }
@@ -223,18 +344,32 @@ def process_sections(section_urls: List[str], log_placeholder):
 
 
 def main() -> None:
-    st.set_page_config(page_title="TinEye URL-отчеты по карточкам", layout="wide")
-    st.title("Генерация TinEye URL по карточкам товаров")
+    st.set_page_config(page_title="TinEye URL-отчеты по товарам", layout="wide")
+    st.title("Генерация TinEye URL по товарам в наличии")
 
     st.markdown(
         """
 - На вход подается ссылка на раздел сайта (или XLS/XLSX со ссылками разделов).
-- Приложение обходит карточки товаров и извлекает артикул + URL изображения.
+- Приложение обходит карточки товаров в разделе.
+- Берет **только товары в наличии**.
+- Из карточки берет **главное изображение товара** (иконки/технические картинки фильтруются).
 - В отчет записывается: **Артикул**, **Ссылка на сайт**, **TinEye URL запроса**.
-- Парсинг результатов TinEye не выполняется.
-- Если строк в разделе больше 50, отчет автоматически делится на файлы по 50 строк.
+- Если строк больше 50, отчет делится на файлы по 50 строк.
         """
     )
+
+    st.session_state.setdefault("stop_requested", False)
+
+    ctrl_col1, ctrl_col2 = st.columns([1, 1])
+    with ctrl_col1:
+        run = st.button("Сформировать отчеты", type="primary")
+    with ctrl_col2:
+        stop_clicked = st.button("Стоп", type="secondary")
+        if stop_clicked:
+            st.session_state["stop_requested"] = True
+
+    if st.session_state.get("stop_requested", False):
+        st.warning("Запрошена остановка обработки. Для нового запуска нажмите «Сформировать отчеты».")
 
     st.subheader("Логи обработки")
     log_placeholder = st.empty()
@@ -285,16 +420,23 @@ def main() -> None:
     section_urls = list(dict.fromkeys(section_urls))
     st.info(f"Разделов к обработке: {len(section_urls)}")
 
-    run = st.button("Сформировать отчеты", type="primary", disabled=(len(section_urls) == 0))
     if run:
         st.session_state["ui_logs"] = []
+        st.session_state["stop_requested"] = False
         append_log("Старт обработки")
         render_logs(log_placeholder)
+
+        if not section_urls:
+            st.warning("Нет ссылок разделов для обработки.")
+            return
 
         files_payload, stats = process_sections(section_urls, log_placeholder)
 
         st.success(
-            f"Готово. Разделов: {stats['sections']} | Карточек: {stats['products']} | "
+            "Готово. "
+            f"Карточек проверено: {stats['checked']} | "
+            f"В наличии: {stats['in_stock']} | "
+            f"Пропущено (нет в наличии): {stats['skipped_not_in_stock']} | "
             f"Ошибок: {stats['errors']} | Файлов XLSX: {stats['files']}"
         )
 
