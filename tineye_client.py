@@ -25,6 +25,9 @@ STOCK_DOMAINS_FOR_RAW_PARSE = [
     "123rf.com",
     "alamy.com",
     "freepik.com",
+    "canva.com",
+    "vecteezy.com",
+    "rawpixel.com",
 ]
 
 
@@ -114,6 +117,27 @@ class TinEyeScraperClient:
                 uniq.append(clean)
         return uniq
 
+
+    def _extract_urls_from_escaped_json(self, html_text: str) -> List[str]:
+        # Пояснение: часть ссылок может лежать в JSON как https:\/\/domain\/path.
+        found = re.findall(r'https?:\\/\\/[^"\'\s<>()]+', html_text)
+        urls: List[str] = []
+        for raw in found:
+            fixed = raw.replace("\\/", "/")
+            fixed = ihtml.unescape(fixed)
+            urls.append(fixed)
+        return urls
+
+    def _extract_known_domains_from_html(self, html_text: str) -> List[str]:
+        # Пояснение: если явных ссылок нет, но домен стока упоминается текстом,
+        # формируем хотя бы базовый URL домена, чтобы не терять результат.
+        lowered = html_text.lower()
+        out: List[str] = []
+        for domain in STOCK_DOMAINS_FOR_RAW_PARSE:
+            if domain in lowered:
+                out.append(f"https://{domain}")
+        return out
+
     def _parse_results(self, html: str, final_url: str, top_n: int) -> List[Dict[str, str]]:
         soup = BeautifulSoup(html, "html.parser")
         normalized: List[Dict[str, str]] = []
@@ -177,6 +201,18 @@ class TinEyeScraperClient:
         # 4) Стоковые URL по сырому HTML
         for stock_url in self._extract_stock_urls_from_raw_html(html):
             push(stock_url, "raw_html_stock_match")
+            if len(normalized) >= top_n:
+                return normalized[:top_n]
+
+        # 5) URL из экранированного JSON (https:\/\/...)
+        for url in self._extract_urls_from_escaped_json(html):
+            push(url, "escaped_json_match")
+            if len(normalized) >= top_n:
+                return normalized[:top_n]
+
+        # 6) Домены стоков, встречающиеся в тексте, даже без полной ссылки
+        for domain_url in self._extract_known_domains_from_html(html):
+            push(domain_url, "known_domain_in_html")
             if len(normalized) >= top_n:
                 return normalized[:top_n]
 
