@@ -1,155 +1,105 @@
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-from typing import Dict, List, Set, Tuple
-from urllib.parse import urljoin, urlparse
+import re
+from io import BytesIO
+from typing import Dict, List, Tuple
+from urllib.parse import urlencode, urljoin, urlparse
+from zipfile import ZIP_DEFLATED, ZipFile
 
-import requests
 import streamlit as st
+import requests
 from bs4 import BeautifulSoup
 
-from config import read_secret_or_env
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
 from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns
-from storage import Storage
-from tineye_client import TinEyeScraperClient, TinEyeScraperSettings
 
-DB_PATH = Path("cache.db")
-MAX_FILE_SIZE = 25 * 1024 * 1024
 TIMEOUT_SECONDS = 20
-DEFAULT_TOP_N = 20
+REPORT_CHUNK_SIZE = 50
 
 
-def get_image_hash(image_url: str) -> str:
-    # Пояснение: кэшируем по хэшу изображения; fallback на URL+ETag/Last-Modified,
-    # если бинарник недоступен.
-    headers = {"User-Agent": "StopImages/2.0"}
-    try:
-        resp = requests.get(image_url, timeout=TIMEOUT_SECONDS, stream=True, allow_redirects=True, headers=headers)
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "").lower()
-        if not content_type.startswith("image/"):
-            raise ValueError("URL не указывает на image/*")
-
-        total = 0
-        digest = hashlib.sha256()
-        for chunk in resp.iter_content(chunk_size=1024 * 128):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > MAX_FILE_SIZE:
-                raise ValueError("Размер изображения превышает 25 МБ")
-            digest.update(chunk)
-        return digest.hexdigest()
-    except Exception:
-        head = requests.head(image_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
-        fallback_base = f"{image_url}|{head.headers.get('ETag','')}|{head.headers.get('Last-Modified','')}"
-        return hashlib.sha256(fallback_base.encode("utf-8")).hexdigest()
+def append_log(message: str) -> None:
+    # Пояснение: собираем лог-строки в session_state, чтобы отображать их прямо в интерфейсе.
+    st.session_state.setdefault("ui_logs", [])
+    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-500:]
 
 
-def make_row_key(product_url: str, src_index: int) -> str:
-    return hashlib.sha256(f"{src_index}|{product_url}".encode("utf-8")).hexdigest()
+def render_logs(placeholder) -> None:
+    logs = st.session_state.get("ui_logs", [])
+    placeholder.code("\n".join(logs[-200:]) if logs else "Логи пока отсутствуют.", language="text")
 
 
-def download_image_bytes(image_url: str) -> Tuple[bytes, str, str]:
-    # Пояснение: загружаем бинарник изображения для последующей загрузки в веб-интерфейс TinEye.
-    headers = {"User-Agent": "StopImages/2.0"}
-    resp = requests.get(image_url, timeout=TIMEOUT_SECONDS, stream=True, allow_redirects=True, headers=headers)
+def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com") -> str:
+    # Пояснение: формируем URL для сценария "Search by image url".
+    return f"{base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
+
+
+def scrape_product_links_from_section(section_url: str) -> List[str]:
+    # Пояснение: из страницы категории собираем ссылки карточек товаров.
+    headers = {"User-Agent": "Mozilla/5.0 StopImages/3.0"}
+    resp = requests.get(section_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
     resp.raise_for_status()
-    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-    if not content_type.startswith("image/"):
-        raise ValueError(f"Ресурс не image/*: {content_type}")
 
-    chunks = []
-    total = 0
-    for chunk in resp.iter_content(chunk_size=1024 * 128):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > MAX_FILE_SIZE:
-            raise ValueError("Размер изображения превышает 25 МБ")
-        chunks.append(chunk)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    base_host = urlparse(section_url).netloc.lower()
 
-    image_bytes = b"".join(chunks)
-    ext = content_type.split("/")[-1] or "jpg"
-    filename = f"upload_image.{ext}"
-    return image_bytes, filename, content_type
+    selectors = [
+        "a.product-item-link[href]",
+        "a.product-card[href]",
+        "a.catalog-item[href]",
+        "div.product-item a[href]",
+        "article a[href]",
+        "a[href]",
+    ]
+
+    links: List[str] = []
+    seen = set()
+    for selector in selectors:
+        for a in soup.select(selector):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith("#"):
+                continue
+            full = urljoin(section_url, href)
+            parsed = urlparse(full)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if parsed.netloc.lower() != base_host:
+                continue
+            if not any(token in parsed.path.lower() for token in ["/catalog/", "/product/", "/item/"]):
+                continue
+            if full not in seen:
+                seen.add(full)
+                links.append(full)
+    return links
+
 
 def _extract_product_image_candidates(soup: BeautifulSoup, product_url: str) -> List[str]:
-    # Пояснение: собираем кандидаты изображения из мета-тегов, JSON-LD и типовых галерей карточки.
+    # Пояснение: собираем возможные URL изображения из мета-тегов и HTML карточки.
     candidates: List[str] = []
 
-    for meta_selector in [
-        "meta[property='og:image']",
-        "meta[name='twitter:image']",
-        "meta[itemprop='image']",
-    ]:
-        node = soup.select_one(meta_selector)
+    for selector in ["meta[property='og:image']", "meta[name='twitter:image']", "meta[itemprop='image']"]:
+        node = soup.select_one(selector)
         if node and node.get("content"):
             candidates.append(urljoin(product_url, node.get("content", "").strip()))
 
-    for script in soup.select("script[type='application/ld+json']"):
-        text = (script.string or script.get_text() or "").strip()
-        if not text:
-            continue
-        try:
-            import json
+    for img in soup.select("img"):
+        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        if src:
+            candidates.append(urljoin(product_url, src))
 
-            payload = json.loads(text)
-        except Exception:
-            continue
-
-        stack = [payload]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, dict):
-                for k, v in item.items():
-                    if k == "image":
-                        if isinstance(v, str):
-                            candidates.append(urljoin(product_url, v))
-                        elif isinstance(v, list):
-                            for vv in v:
-                                if isinstance(vv, str):
-                                    candidates.append(urljoin(product_url, vv))
-                    else:
-                        stack.append(v)
-            elif isinstance(item, list):
-                stack.extend(item)
-
-    gallery_selectors = [
-        "img[itemprop='image']",
-        ".product-gallery img",
-        ".product-images img",
-        ".product-card img",
-        "img",
-    ]
-    for selector in gallery_selectors:
-        for img in soup.select(selector):
-            src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
-            if not src:
-                continue
-            full = urljoin(product_url, src)
-            candidates.append(full)
-
-    # де-дупликат с сохранением порядка
-    uniq: List[str] = []
+    unique: List[str] = []
     seen = set()
     for c in candidates:
         if c not in seen:
             seen.add(c)
-            uniq.append(c)
-    return uniq
+            unique.append(c)
+    return unique
 
 
 def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, str]:
-    # Пояснение: с карточки товара извлекаем артикул и главное изображение.
-    headers = {"User-Agent": "Mozilla/5.0 StopImages/2.0"}
+    # Пояснение: для отчета берем артикул из карточки и URL изображения для TinEye-ссылки.
+    headers = {"User-Agent": "Mozilla/5.0 StopImages/3.0"}
     resp = requests.get(product_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
     resp.raise_for_status()
-
-    if resp.headers.get("content-type", "").lower().startswith("image/"):
-        return "", product_url
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -172,461 +122,205 @@ def extract_article_and_image_from_product_page(product_url: str) -> Tuple[str, 
     if not image_candidates:
         raise ValueError("Не найдено изображение в карточке товара")
 
-    # Пояснение: отдаем первый релевантный кандидат; при необходимости кэш компенсирует повторы.
-    image_url = image_candidates[0]
-    return article, image_url
+    return article, image_candidates[0]
 
 
-def scrape_product_links_from_section(section_url: str) -> List[str]:
-    # Пояснение: со страницы раздела собираем ссылки на карточки товаров.
-    headers = {"User-Agent": "Mozilla/5.0 StopImages/2.0"}
-    resp = requests.get(section_url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=headers)
-    resp.raise_for_status()
+def get_second_level_category_name(section_url: str) -> str:
+    # Пояснение: имя файла строим из категории 2-го уровня URL раздела.
+    parts = [p for p in urlparse(section_url).path.split("/") if p]
+    category = "report"
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    base_host = urlparse(section_url).netloc.lower()
+    if "catalog" in parts:
+        idx = parts.index("catalog")
+        if len(parts) > idx + 2:
+            category = parts[idx + 2]
+        elif len(parts) > idx + 1:
+            category = parts[idx + 1]
+    elif len(parts) >= 2:
+        category = parts[1]
+    elif parts:
+        category = parts[0]
 
-    selectors = [
-        "a.product-item-link[href]",
-        "a.product-card[href]",
-        "a.catalog-item[href]",
-        "div.product-item a[href]",
-        "article a[href]",
-        "a[href]",
-    ]
-
-    links: List[str] = []
-    seen: Set[str] = set()
-
-    for selector in selectors:
-        for a in soup.select(selector):
-            href = (a.get("href") or "").strip()
-            if not href or href.startswith("#"):
-                continue
-            full = urljoin(section_url, href)
-            parsed = urlparse(full)
-            if parsed.scheme not in {"http", "https"}:
-                continue
-            if parsed.netloc.lower() != base_host:
-                continue
-            # Фильтруем очевидно не-карточки.
-            if any(x in parsed.path.lower() for x in ["/catalog/", "/product/", "/item/"]):
-                if full not in seen:
-                    seen.add(full)
-                    links.append(full)
-
-    return links
+    safe = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "_", category).strip("_")
+    return safe or "report"
 
 
+def split_records(records: List[Dict[str, str]], chunk_size: int = REPORT_CHUNK_SIZE) -> List[List[Dict[str, str]]]:
+    return [records[i : i + chunk_size] for i in range(0, len(records), chunk_size)]
 
 
+def build_zip_with_reports(files_payload: List[Tuple[str, bytes]]) -> bytes:
+    # Пояснение: если отчетов несколько, отдаем одним ZIP-архивом.
+    buf = BytesIO()
+    with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
+        for filename, payload in files_payload:
+            zf.writestr(filename, payload)
+    return buf.getvalue()
 
 
-def build_tineye_search_url(base_url: str, image_url: str) -> str:
-    # Пояснение: формируем наглядный URL запроса TinEye для блока в интерфейсе.
-    from urllib.parse import urlencode
+def process_sections(section_urls: List[str], log_placeholder):
+    all_report_files: List[Tuple[str, bytes]] = []
+    total_products = 0
+    total_errors = 0
 
-    return f"{base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
-
-
-def is_target_shutterstock_url(url: str) -> bool:
-    # Пояснение: в отчет попадают только ссылки, начинающиеся на https://www.shutterstock.com
-    return str(url).startswith("https://www.shutterstock.com")
-
-
-def render_tineye_request_url(url_placeholder, url_value: str) -> None:
-    # Пояснение: отдельный блок UI, где явно виден сформированный запрос к TinEye.
-    if not url_value:
-        url_placeholder.code("TinEye URL пока не сформирован.", language="text")
-    else:
-        url_placeholder.code(url_value, language="text")
-
-
-
-def set_last_tineye_rows(rows: List[Dict[str, str]]) -> None:
-    # Пояснение: сохраняем последние найденные ссылки TinEye для наглядного показа в UI.
-    st.session_state["last_tineye_rows"] = rows
-
-
-def render_last_tineye_rows() -> None:
-    # Пояснение: отдельный диагностический блок со списком распарсенных ссылок TinEye.
-    rows = st.session_state.get("last_tineye_rows", [])
-    st.subheader("Что удалось распарсить из TinEye URL")
-    if rows:
-        st.dataframe(rows, use_container_width=True)
-    else:
-        st.caption("Пока нет данных для отображения.")
-
-
-
-def render_semi_auto_help() -> None:
-    # Пояснение: объясняем, как передать сессию после ручного прохождения browser-check.
-    with st.expander("Полуавтоматический режим TinEye (ручной проход проверки)", expanded=False):
-        st.markdown(
-            """
-1. Откройте `https://tineye.com/` в обычном браузере и вручную пройдите проверку (`Just a moment...`).
-2. Откройте DevTools → `Application/Storage` → `Cookies` (или вкладка `Network`, любой запрос к `tineye.com`).
-3. Скопируйте строку cookie в формате `name1=value1; name2=value2`.
-4. Вставьте её в поле **Cookie сессии TinEye** ниже и нажмите **Применить Cookie**.
-5. После этого запускайте пакетную/одиночную проверку из приложения.
-
-⚠️ Cookie со временем протухает. Если снова видите anti-bot ошибку, получите свежую cookie и примените заново.
-            """
-        )
-
-
-def init_tineye_cookie_state() -> None:
-    # Пояснение: храним cookie в session_state, чтобы использовать её в текущей сессии Streamlit.
-    st.session_state.setdefault("tineye_cookie", "")
-
-
-def render_cookie_status() -> None:
-    # Пояснение: показываем пользователю текущий статус полуавтоматической сессии.
-    cookie_set = bool(st.session_state.get("tineye_cookie", "").strip())
-    if cookie_set:
-        st.success("Cookie TinEye применена для текущей сессии приложения.")
-    else:
-        st.info("Cookie TinEye не задана. Возможна блокировка anti-bot на стороне TinEye.")
-
-def init_logs() -> None:
-    # Пояснение: логи храним в session_state, чтобы пользователь видел ход обработки в UI.
-    if "ui_logs" not in st.session_state:
-        st.session_state["ui_logs"] = []
-
-
-def append_log(message: str) -> None:
-    # Пояснение: централизованное добавление строк лога с ограничением размера буфера.
-    logs = st.session_state.get("ui_logs", [])
-    logs.append(message)
-    st.session_state["ui_logs"] = logs[-500:]
-
-
-def render_logs(log_placeholder) -> None:
-    # Пояснение: показываем последние строки лога в отдельном блоке интерфейса.
-    logs = st.session_state.get("ui_logs", [])
-    text = "\n".join(logs[-200:]) if logs else "Логи пока отсутствуют."
-    log_placeholder.code(text, language="text")
-
-def show_help() -> None:
-    with st.expander("Как работает механика проверки", expanded=False):
-        # Пояснение: объясняем эквивалент механики "Search image on TinEye" в автоматическом режиме.
-        st.markdown(
-            """
-1. Вы даете ссылку на раздел сайта.
-2. Приложение скрапит карточки товаров в разделе.
-3. Для каждой карточки извлекается изображение и выполняется поиск в TinEye.
-4. Это программный эквивалент ручного пункта **Search image on TinEye** из контекстного меню браузера.
-5. В отчет попадают только ссылки, начинающиеся с `https://www.shutterstock.com`.
-            """
-        )
-
-
-def process_batch(
-    products: List[Dict[str, str]],
-    storage: Storage,
-    tineye_client: TinEyeScraperClient,
-    batch_size: int,
-    log_placeholder,
-    tineye_url_placeholder,
-):
-    # Пояснение: стартовая карточка фиксирована с первой позиции по требованию.
-    start_idx = 0
-    end_idx = min(len(products), start_idx + batch_size)
-    batch = list(enumerate(products[start_idx:end_idx], start=start_idx))
-
-    run_id = storage.create_batch_run(start_row=1, batch_size=batch_size, top_n=DEFAULT_TOP_N)
     progress = st.progress(0.0)
-    status_box = st.empty()
+    total_sections = len(section_urls)
 
-    processed_count = 0
-    error_count = 0
-    matched_count = 0
-    batch_keys: List[str] = []
-
-    for i, (src_index, product) in enumerate(batch, start=1):
-        product_url = product["product_url"]
-        row_key = make_row_key(product_url, src_index)
-        batch_keys.append(row_key)
-        status_msg = f"Обработка карточки {src_index + 1} ({i}/{len(batch)})"
-        status_box.info(status_msg)
-        append_log(status_msg)
+    for section_idx, section_url in enumerate(section_urls, start=1):
+        append_log(f"Раздел {section_idx}/{total_sections}: {section_url}")
         render_logs(log_placeholder)
 
         try:
-            article, image_url = extract_article_and_image_from_product_page(product_url)
-            append_log(f"Извлечено изображение: {image_url}")
-            image_bytes, _, _ = download_image_bytes(image_url)
-            image_hash = hashlib.sha256(image_bytes).hexdigest()
-            cached = storage.get_cached_results(image_hash)
-            if cached is None:
-                append_log(f"TinEye url-запрос с извлеченным image_url: {image_url}")
-                tineye_request_url = tineye_client.build_search_url(image_url)
-                render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
-                # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не URL карточки.
-                tineye_results = tineye_client.search_by_tineye_url(tineye_request_url, top_n=DEFAULT_TOP_N)
-                storage.set_cached_results(image_hash, tineye_results)
-                append_log(f"Кэш сохранен: {image_hash[:12]}")
-            else:
-                tineye_results = cached
-                append_log(f"Использован кэш: {image_hash[:12]}")
-
-            report_rows = []
-            parsed_rows_for_ui = []
-            for result in tineye_results:
-                result_url = result.get("page_url", "")
-                append_log(f"TinEye результат: {result_url}")
-                if result_url:
-                    parsed_rows_for_ui.append({"Ссылка в результатах TinEye": result_url})
-                    if is_target_shutterstock_url(result_url):
-                        report_rows.append(
-                            {
-                                "Артикул товара": article,
-                                "Ссылка на сайт": product_url,
-                                "Ссылка в результатах TinEye": result_url,
-                            }
-                        )
-
-            set_last_tineye_rows(parsed_rows_for_ui)
-            storage.upsert_row_status(row_key, "done", image_hash, len(report_rows), None)
-            if report_rows:
-                storage.add_report_rows(row_key, report_rows)
-                matched_count += len(report_rows)
-                append_log(f"Найдено ссылок https://www.shutterstock.com: {len(report_rows)} | {product_url}")
-            else:
-                append_log(f"Ссылки https://www.shutterstock.com не найдены | {product_url}")
-            processed_count += 1
-
+            product_links = scrape_product_links_from_section(section_url)
+            append_log(f"Найдено карточек: {len(product_links)}")
+            render_logs(log_placeholder)
         except Exception as exc:
-            storage.upsert_row_status(row_key, "error", None, 0, str(exc))
-            append_log(f"Ошибка: {product_url} | {exc}")
-            error_count += 1
-            processed_count += 1
+            total_errors += 1
+            append_log(f"Ошибка парсинга раздела: {exc}")
+            render_logs(log_placeholder)
+            progress.progress(section_idx / max(1, total_sections))
+            continue
 
-        progress_line = f"Обработано: {processed_count} | В очереди: {len(batch)-processed_count} | Ошибки: {error_count} | Совпадения: {matched_count}"
-        st.caption(progress_line)
-        append_log(progress_line)
+        section_rows: List[Dict[str, str]] = []
+        for product_url in product_links:
+            try:
+                article, image_url = extract_article_and_image_from_product_page(product_url)
+                tineye_url = build_tineye_search_url(image_url)
+                section_rows.append(
+                    {
+                        "Артикул": article,
+                        "Ссылка на сайт": product_url,
+                        "TinEye URL запроса": tineye_url,
+                    }
+                )
+                total_products += 1
+                append_log(f"Подготовлен TinEye URL: {tineye_url}")
+            except Exception as exc:
+                total_errors += 1
+                append_log(f"Ошибка карточки {product_url}: {exc}")
+            render_logs(log_placeholder)
+
+        chunks = split_records(section_rows, REPORT_CHUNK_SIZE)
+        category_name = get_second_level_category_name(section_url)
+        for i, chunk_rows in enumerate(chunks, start=1):
+            file_suffix = f"_{i}" if len(chunks) > 1 else ""
+            filename = f"{category_name}{file_suffix}.xlsx"
+            all_report_files.append((filename, build_report(chunk_rows)))
+
+        append_log(
+            f"Сформировано файлов по разделу: {len(chunks)} (размер каждого до {REPORT_CHUNK_SIZE} строк)"
+        )
         render_logs(log_placeholder)
-        progress.progress(i / max(1, len(batch)))
+        progress.progress(section_idx / max(1, total_sections))
 
-    storage.finish_batch_run(run_id, processed_count, error_count, matched_count)
-    return storage.get_report_rows_for_keys(batch_keys), {"processed": processed_count, "errors": error_count, "matches": matched_count}
-
-
-def check_single_url(
-    source_url: str,
-    storage: Storage,
-    tineye_client: TinEyeScraperClient,
-    tineye_url_placeholder,
-) -> List[Dict[str, str]]:
-    # Пояснение: вкладка "Проверка URL" проверяет одно URL страницы без пакетного режима.
-    source_url = source_url.strip()
-    if not source_url:
-        return []
-
-    article, image_url = extract_article_and_image_from_product_page(source_url)
-    append_log(f"Одиночная проверка: извлечено изображение {image_url}")
-    image_bytes, _, _ = download_image_bytes(image_url)
-    image_hash = hashlib.sha256(image_bytes).hexdigest()
-    cached = storage.get_cached_results(image_hash)
-    if cached is None:
-        append_log(f"TinEye url-запрос для одиночной проверки с image_url: {image_url}")
-        tineye_request_url = tineye_client.build_search_url(image_url)
-        render_tineye_request_url(tineye_url_placeholder, tineye_request_url)
-        # Пояснение: в TinEye передаем именно извлеченный URL изображения, а не исходный URL страницы.
-        results = tineye_client.search_by_tineye_url(tineye_request_url, top_n=DEFAULT_TOP_N)
-        storage.set_cached_results(image_hash, results)
-    else:
-        append_log(f"Одиночная проверка: использован кэш {image_hash[:12]}")
-        results = cached
-
-    rows: List[Dict[str, str]] = []
-    parsed_rows_for_ui: List[Dict[str, str]] = []
-    for item in results:
-        result_url = item.get("page_url", "")
-        append_log(f"TinEye результат: {result_url}")
-        if result_url:
-            parsed_rows_for_ui.append({"Ссылка в результатах TinEye": result_url})
-            if is_target_shutterstock_url(result_url):
-                rows.append({
-                    "Артикул товара": article,
-                    "Ссылка на сайт": source_url,
-                    "Ссылка в результатах TinEye": result_url,
-                })
-    set_last_tineye_rows(parsed_rows_for_ui)
-    return rows
+    stats = {
+        "sections": len(section_urls),
+        "products": total_products,
+        "errors": total_errors,
+        "files": len(all_report_files),
+    }
+    return all_report_files, stats
 
 
 def main() -> None:
-    st.set_page_config(page_title="Проверка раздела сайта через TinEye", layout="wide")
-    st.title("Проверка карточек товаров из раздела сайта")
+    st.set_page_config(page_title="TinEye URL-отчеты по карточкам", layout="wide")
+    st.title("Генерация TinEye URL по карточкам товаров")
 
-    storage = Storage(DB_PATH)
-    tineye_client = TinEyeScraperClient(
-        TinEyeScraperSettings(base_url=read_secret_or_env("TINEYE_BASE_URL", "https://tineye.com"), timeout_seconds=30)
+    st.markdown(
+        """
+- На вход подается ссылка на раздел сайта (или XLS/XLSX со ссылками разделов).
+- Приложение обходит карточки товаров и извлекает артикул + URL изображения.
+- В отчет записывается: **Артикул**, **Ссылка на сайт**, **TinEye URL запроса**.
+- Парсинг результатов TinEye не выполняется.
+- Если строк в разделе больше 50, отчет автоматически делится на файлы по 50 строк.
+        """
     )
-
-    init_logs()
-    init_tineye_cookie_state()
-    show_help()
-    render_semi_auto_help()
-
-    st.subheader("Сессия TinEye")
-    cookie_value = st.text_area(
-        "Cookie сессии TinEye",
-        value=st.session_state.get("tineye_cookie", ""),
-        height=120,
-        placeholder="cf_clearance=...; __cf_bm=...",
-        help="Вставьте Cookie после ручного прохождения проверки на сайте TinEye.",
-    )
-    cookie_col_apply, cookie_col_clear = st.columns([1, 1])
-    if cookie_col_apply.button("Применить Cookie", key="apply_cookie"):
-        st.session_state["tineye_cookie"] = cookie_value.strip()
-        tineye_client.apply_cookie_header(st.session_state["tineye_cookie"])
-        append_log("Cookie TinEye применена к HTTP-сессии")
-    if cookie_col_clear.button("Очистить Cookie", key="clear_cookie"):
-        st.session_state["tineye_cookie"] = ""
-        tineye_client.apply_cookie_header("")
-        append_log("Cookie TinEye очищена")
-
-    # Пояснение: на каждый рендер синхронизируем cookie из session_state в HTTP-сессию клиента.
-    tineye_client.apply_cookie_header(st.session_state.get("tineye_cookie", ""))
-    render_cookie_status()
 
     st.subheader("Логи обработки")
     log_placeholder = st.empty()
     render_logs(log_placeholder)
 
-    st.subheader("Сформированный TinEye URL запроса")
-    tineye_url_placeholder = st.empty()
-    render_tineye_request_url(tineye_url_placeholder, "")
+    input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
+    source_df = None
+    mapping_confirmed: Dict[str, str] = {}
 
-    render_last_tineye_rows()
+    if input_mode == "Ручной ввод URL разделов":
+        text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
+        source_df = make_rows_from_manual_input(text)
+        mapping_confirmed = {"input_url": "input_url"}
+    else:
+        upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
+        if upload is not None:
+            df_raw = read_excel(upload)
+            st.dataframe(df_raw.head(10), use_container_width=True)
+            auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
+            st.subheader("Сопоставление колонок")
+            if not needs_manual:
+                mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
+                st.success("Автосопоставление выполнено.")
+            else:
+                st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
+                options = [""] + list(df_raw.columns)
+                default = auto_mapping.get("input_url") or ""
+                selected = st.selectbox(
+                    FIELD_LABELS["input_url"],
+                    options=options,
+                    index=options.index(default) if default in options else 0,
+                    key="map_input_url",
+                )
+                if selected:
+                    mapping_confirmed["input_url"] = selected
 
-    tab_batch, tab_single = st.tabs(["Пакетная проверка разделов", "Проверка URL"])
+            if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
+                source_df = make_rows_from_excel(df_raw, mapping_confirmed)
 
-    with tab_batch:
-        input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
-        source_df = None
-        mapping_confirmed: Dict[str, str] = {}
+    section_urls: List[str] = []
+    if source_df is not None:
+        section_urls = [
+            str(r.get("input_url", "")).strip()
+            for r in source_df.fillna("").to_dict(orient="records")
+            if str(r.get("input_url", "")).strip()
+        ]
 
-        if input_mode == "Ручной ввод URL разделов":
-            text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
-            source_df = make_rows_from_manual_input(text)
-            mapping_confirmed = {"input_url": "input_url"}
-        else:
-            upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
-            if upload is not None:
-                df_raw = read_excel(upload)
-                st.dataframe(df_raw.head(10), use_container_width=True)
-                auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
-                st.subheader("Сопоставление колонок")
-                if not needs_manual:
-                    mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
-                    st.success("Автосопоставление выполнено.")
-                else:
-                    st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
-                    options = [""] + list(df_raw.columns)
-                    default = auto_mapping.get("input_url") or ""
-                    selected = st.selectbox(
-                        FIELD_LABELS["input_url"],
-                        options=options,
-                        index=options.index(default) if default in options else 0,
-                        key="map_input_url",
-                    )
-                    if selected:
-                        mapping_confirmed["input_url"] = selected
+    section_urls = list(dict.fromkeys(section_urls))
+    st.info(f"Разделов к обработке: {len(section_urls)}")
 
-                if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
-                    source_df = make_rows_from_excel(df_raw, mapping_confirmed)
-
-        products: List[Dict[str, str]] = []
-        if source_df is not None:
-            section_urls = [
-                str(r.get("input_url", "")).strip()
-                for r in source_df.fillna("").to_dict(orient="records")
-                if str(r.get("input_url", "")).strip()
-            ]
-            if section_urls:
-                with st.expander("Найденные карточки товаров", expanded=False):
-                    for section_url in section_urls:
-                        try:
-                            links = scrape_product_links_from_section(section_url)
-                            line = f"{section_url} → найдено карточек: {len(links)}"
-                            st.write(line)
-                            append_log(line)
-                            render_logs(log_placeholder)
-                            products.extend({"product_url": link} for link in links)
-                        except Exception as exc:
-                            warn = f"Ошибка парсинга раздела {section_url}: {exc}"
-                            st.warning(warn)
-                            append_log(warn)
-                            render_logs(log_placeholder)
-
-        uniq = []
-        seen = set()
-        for item in products:
-            if item["product_url"] not in seen:
-                seen.add(item["product_url"])
-                uniq.append(item)
-        products = uniq
-
-        st.info(f"Всего карточек к проверке: {len(products)}")
-
-        batch_size = st.selectbox("Размер партии", [50, 100, 200], index=0)
-        run = st.button("Запустить партию", type="primary", disabled=(len(products) == 0), key="run_batch")
-
-    with tab_single:
-        # Пояснение: отдельная вкладка для проверки одной страницы по URL.
-        one_url = st.text_input("Введите URL страницы товара")
-        run_one = st.button("Проверить URL", type="primary", key="run_one")
-        if run_one:
-            st.session_state["ui_logs"] = []
-            append_log(f"Старт проверки одного URL: {one_url}")
-            render_logs(log_placeholder)
-            try:
-                rows = check_single_url(one_url, storage, tineye_client, tineye_url_placeholder)
-                if rows:
-                    st.success(f"Найдено ссылок https://www.shutterstock.com: {len(rows)}")
-                    st.dataframe(rows, use_container_width=True)
-                    st.download_button(
-                        label="Скачать XLSX-отчет по URL",
-                        data=build_report(rows),
-                        file_name="single_url_report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="download_one",
-                    )
-                else:
-                    st.info("Ссылки https://www.shutterstock.com не найдены.")
-                append_log("Одиночная проверка завершена")
-                render_logs(log_placeholder)
-            except Exception as exc:
-                st.error(f"Ошибка проверки URL: {exc}")
-                append_log(f"Ошибка одиночной проверки: {exc}")
-                render_logs(log_placeholder)
-
+    run = st.button("Сформировать отчеты", type="primary", disabled=(len(section_urls) == 0))
     if run:
         st.session_state["ui_logs"] = []
-        append_log("Старт пакетной обработки")
+        append_log("Старт обработки")
         render_logs(log_placeholder)
-        report_records, stats = process_batch(
-            products=products,
-            storage=storage,
-            tineye_client=tineye_client,
-            batch_size=int(batch_size),
-            log_placeholder=log_placeholder,
-            tineye_url_placeholder=tineye_url_placeholder,
-        )
+
+        files_payload, stats = process_sections(section_urls, log_placeholder)
 
         st.success(
-            f"Партия завершена: обработано {stats['processed']}, ошибок {stats['errors']}, совпадений {stats['matches']}"
+            f"Готово. Разделов: {stats['sections']} | Карточек: {stats['products']} | "
+            f"Ошибок: {stats['errors']} | Файлов XLSX: {stats['files']}"
         )
-        report_bytes = build_report(report_records)
-        st.download_button(
-            label="Скачать XLSX-отчет",
-            data=report_bytes,
-            file_name=f"stock_report_size{int(batch_size)}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+
+        if not files_payload:
+            st.info("Нет данных для формирования отчетов.")
+            return
+
+        if len(files_payload) == 1:
+            filename, payload = files_payload[0]
+            st.download_button(
+                label=f"Скачать {filename}",
+                data=payload,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            zip_payload = build_zip_with_reports(files_payload)
+            st.download_button(
+                label="Скачать все отчеты ZIP",
+                data=zip_payload,
+                file_name="tineye_reports.zip",
+                mime="application/zip",
+            )
+            with st.expander("Список сформированных файлов", expanded=False):
+                for filename, _ in files_payload:
+                    st.write(filename)
 
 
 if __name__ == "__main__":
