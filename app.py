@@ -124,11 +124,15 @@ def render_logs(placeholder=None) -> None:
     if placeholder is None:
         return
 
-    text = "\n".join(logs[-400:]) if logs else "Логи пока отсутствуют."
-    safe_text = html.escape(text)
+    if logs:
+        # Пояснение: каждый лог выводится отдельной строкой.
+        safe_text = "<br>".join(html.escape(line) for line in logs[-400:])
+    else:
+        safe_text = "Логи пока отсутствуют."
+
     placeholder.markdown(
         f"""
-<div class="log-box"><pre>{safe_text}</pre></div>
+<div class="log-box"><div class="log-lines">{safe_text}</div></div>
 """,
         unsafe_allow_html=True,
     )
@@ -782,9 +786,42 @@ def process_sections(section_urls: List[str], log_placeholder, progress_placehol
     return all_report_files, stats
 
 
+
+def build_zip_filename(section_urls: List[str]) -> str:
+    # Пояснение: имя ZIP формируем от имени категории, как просил пользователь.
+    if len(section_urls) == 1:
+        return f"{get_second_level_category_name(section_urls[0])}.zip"
+    if section_urls:
+        return f"{get_second_level_category_name(section_urls[0])}_multi.zip"
+    return "report.zip"
+
 def main() -> None:
     st.set_page_config(page_title="TinEye URL-отчеты по товарам", layout="wide")
     st.title("Генерация TinEye URL по товарам в наличии")
+
+    st.markdown(
+        """
+<style>
+.log-box {
+  height: 190px;
+  overflow-y: auto;
+  border: 1px solid #d9d9d9;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #0e1117;
+}
+.log-box .log-lines {
+  margin: 0;
+  white-space: normal;
+  word-break: break-word;
+  color: #f0f2f6;
+  font-size: 12px;
+  line-height: 1.35;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown(
         """
@@ -865,9 +902,9 @@ def main() -> None:
     progress_placeholder = st.empty()
 
     # Пояснение: плейсхолдер логов создаем до запуска, чтобы обновлять логи в реальном времени.
-    st.subheader("Логи обработки")
-    bottom_log_placeholder = st.empty()
-    render_logs(bottom_log_placeholder)
+    with st.expander("Логи обработки", expanded=False):
+        bottom_log_placeholder = st.empty()
+        render_logs(bottom_log_placeholder)
 
     if run:
         st.session_state["ui_logs"] = []
@@ -907,7 +944,7 @@ def main() -> None:
             st.download_button(
                 label="Скачать все отчеты ZIP",
                 data=zip_payload,
-                file_name="tineye_reports.zip",
+                file_name=build_zip_filename(section_urls),
                 mime="application/zip",
             )
             with st.expander("Список сформированных файлов", expanded=False):
