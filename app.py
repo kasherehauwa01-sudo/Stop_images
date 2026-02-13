@@ -182,9 +182,33 @@ def extract_preview_from_card(card: Tag, page_url: str) -> str:
     return ""
 
 
-def looks_like_product_link(href: str) -> bool:
-    lower = href.lower()
-    return any(h in lower for h in PRODUCT_PATH_HINTS)
+def looks_like_product_link(path: str, section_path: str = "") -> bool:
+    # Пояснение: товарная карточка обычно глубже, чем сама категория, и чаще содержит ID в конце.
+    lower = path.lower()
+    if not any(h in lower for h in PRODUCT_PATH_HINTS):
+        return False
+
+    section_norm = section_path.rstrip("/").lower()
+    path_norm = lower.rstrip("/")
+    if section_norm and path_norm == section_norm:
+        return False
+
+    parts = [p for p in path_norm.split("/") if p]
+    # минимальная глубина отсекает часть ссылок меню/разделов
+    if len(parts) < 4:
+        return False
+
+    last = parts[-1]
+    # Пояснение: на большинстве карточек есть числовой id в конце пути.
+    if re.fullmatch(r"\d+", last):
+        return True
+    if re.search(r"\d", last):
+        return True
+
+    # fallback: допускаем URL с product/item в пути
+    if any(k in path_norm for k in ["/product/", "/item/"]):
+        return True
+    return False
 
 
 def container_signature(tag: Optional[Tag]) -> str:
@@ -223,7 +247,12 @@ def extract_name_from_card(card: Tag, link: Tag) -> str:
     return link.get_text(" ", strip=True)
 
 
-def collect_product_cards_from_html(html: str, page_url: str, base_host: str) -> List[Dict[str, str]]:
+def collect_product_cards_from_html(
+    html: str,
+    page_url: str,
+    base_host: str,
+    section_path: str,
+) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
 
     link_candidates: List[Tuple[Tag, Tag, str]] = []
@@ -239,7 +268,7 @@ def collect_product_cards_from_html(html: str, page_url: str, base_host: str) ->
             continue
         if parsed.netloc.lower() != base_host:
             continue
-        if not looks_like_product_link(parsed.path):
+        if not looks_like_product_link(parsed.path, section_path):
             continue
 
         card = find_best_container_for_link(a)
@@ -273,8 +302,13 @@ def collect_product_cards_from_html(html: str, page_url: str, base_host: str) ->
     return products
 
 
-def discover_pagination_urls(html: str, page_url: str, base_host: str) -> List[str]:
-    # Пояснение: ищем ссылки пагинации (страницы 2,3,...) и URL с параметрами page/PAGEN.
+def discover_pagination_urls(
+    html: str,
+    page_url: str,
+    base_host: str,
+    section_path: str,
+) -> List[str]:
+    # Пояснение: ищем только пагинацию текущей категории, без ссылок на соседние разделы.
     soup = BeautifulSoup(html, "html.parser")
     urls: Set[str] = set()
 
@@ -283,14 +317,24 @@ def discover_pagination_urls(html: str, page_url: str, base_host: str) -> List[s
         href = (a.get("href") or "").strip()
         if not href:
             continue
+
         full = urljoin(page_url, href)
         parsed = urlparse(full)
         if parsed.netloc.lower() != base_host:
             continue
 
+        # Пояснение: пагинация должна оставаться в том же section_path.
+        if section_path and not parsed.path.lower().startswith(section_path.lower()):
+            continue
+
         query = parse_qs(parsed.query)
         has_page_param = any(k.lower().startswith("pagen_") or k.lower() in {"page", "p"} for k in query.keys())
-        is_digit_link = text.isdigit() and int(text) >= 2
+
+        parent_classes = " ".join((a.parent.get("class", []) if isinstance(a.parent, Tag) else [])).lower()
+        is_digit_link = text.isdigit() and int(text) >= 2 and any(
+            key in parent_classes for key in ["pagination", "pager", "nav-pages", "page-navigation"]
+        )
+
         if has_page_param or is_digit_link:
             urls.add(full)
 
@@ -300,7 +344,9 @@ def discover_pagination_urls(html: str, page_url: str, base_host: str) -> List[s
 def scrape_products_from_section(section_url: str, client: HttpClient, max_pages: int = 50) -> List[Dict[str, str]]:
     # Пояснение: проход по категории с поддержкой пагинации и остановками по отсутствию новых товаров.
     first_page = client.get_page(section_url)
-    base_host = urlparse(first_page["final_url"]).netloc.lower()
+    base_parsed = urlparse(first_page["final_url"])
+    base_host = base_parsed.netloc.lower()
+    section_path = base_parsed.path.rstrip("/").lower()
 
     append_log(
         f"Загружена страница категории: source={first_page['source_url']} -> final={first_page['final_url']} | status={first_page['status_code']}"
@@ -318,7 +364,7 @@ def scrape_products_from_section(section_url: str, client: HttpClient, max_pages
         seen_pages.add(page_url)
 
         page = first_page if page_url == first_page["final_url"] else client.get_page(page_url)
-        products = collect_product_cards_from_html(page["html"], page["final_url"], base_host)
+        products = collect_product_cards_from_html(page["html"], page["final_url"], base_host, section_path)
 
         new_count = 0
         for p in products:
@@ -331,12 +377,14 @@ def scrape_products_from_section(section_url: str, client: HttpClient, max_pages
         append_log(
             f"Парсинг страницы каталога: {page['final_url']} | карточек={len(products)} | новых={new_count}"
         )
+        if len(products) > 120:
+            append_log("WARN: подозрительно много карточек на странице — вероятно, в выборку попали ссылки меню/рекомендаций.")
 
         # Пояснение: если новых товаров нет, дальнейшая пагинация обычно бессмысленна.
         if len(products) == 0 or new_count == 0:
             continue
 
-        for nxt in discover_pagination_urls(page["html"], page["final_url"], base_host):
+        for nxt in discover_pagination_urls(page["html"], page["final_url"], base_host, section_path):
             if nxt not in seen_pages and nxt not in queue:
                 queue.append(nxt)
 
