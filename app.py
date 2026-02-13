@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import html
 from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
@@ -118,10 +119,19 @@ def log_step(message: str, placeholder=None) -> None:
 
 
 def render_logs(placeholder=None) -> None:
+    # Пояснение: логи показываем в отдельном прокручиваемом поле фиксированной высоты.
     logs = st.session_state.get("ui_logs", [])
     if placeholder is None:
         return
-    placeholder.code("\n".join(logs[-300:]) if logs else "Логи пока отсутствуют.", language="text")
+
+    text = "\n".join(logs[-400:]) if logs else "Логи пока отсутствуют."
+    safe_text = html.escape(text)
+    placeholder.markdown(
+        f"""
+<div class="log-box"><pre>{safe_text}</pre></div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com") -> str:
@@ -682,7 +692,7 @@ def build_zip_with_reports(files_payload: List[Tuple[str, bytes]]) -> bytes:
     return buf.getvalue()
 
 
-def process_sections(section_urls: List[str], log_placeholder):
+def process_sections(section_urls: List[str], log_placeholder, progress_placeholder, status_placeholder):
     all_report_files: List[Tuple[str, bytes]] = []
     total_checked = 0
     total_in_stock = 0
@@ -691,29 +701,34 @@ def process_sections(section_urls: List[str], log_placeholder):
     total_found_cards = 0
 
     client = HttpClient()
-    progress = st.progress(0.0)
+    status_placeholder.info("Ожидание запуска обработки...")
+    progress = progress_placeholder.progress(0.0)
     total_sections = len(section_urls)
 
     for section_idx, section_url in enumerate(section_urls, start=1):
+        status_placeholder.info(f"Парсинг раздела {section_idx}/{total_sections}")
         log_step(f"Раздел {section_idx}/{total_sections}: {section_url}", log_placeholder)
 
         try:
+            status_placeholder.info("Парсинг страницы каталога")
             products = scrape_products_from_section(section_url, client)
             total_found_cards += len(products)
             log_step(f"Итого уникальных карточек в категории: {len(products)}", log_placeholder)
         except Exception as exc:
             total_errors += 1
             log_step(f"Ошибка парсинга категории: {exc}", log_placeholder)
+            status_placeholder.info(f"Завершен раздел {section_idx}/{total_sections}")
             progress.progress(section_idx / max(1, total_sections))
             continue
 
         section_rows: List[Dict[str, str]] = []
-        card_progress = st.progress(0.0)
         for card_idx, product in enumerate(products, start=1):
             if st.session_state.get("stop_requested", False):
+                status_placeholder.warning("Получена команда СТОП")
                 log_step("Получена команда СТОП. Останавливаем обработку после текущего шага.", log_placeholder)
                 break
 
+            status_placeholder.info(f"Обрабатывается карточка {card_idx} из {len(products)}")
             log_step(f"Обрабатывается карточка {card_idx} из {len(products)}", log_placeholder)
             total_checked += 1
             try:
@@ -740,7 +755,6 @@ def process_sections(section_urls: List[str], log_placeholder):
                 total_errors += 1
                 log_step(f"Ошибка карточки {product['product_url']}: {exc}", log_placeholder)
 
-            card_progress.progress(card_idx / max(1, len(products)))
 
         chunks = split_records(section_rows, REPORT_CHUNK_SIZE)
         category_name = get_second_level_category_name(section_url)
@@ -750,6 +764,7 @@ def process_sections(section_urls: List[str], log_placeholder):
             all_report_files.append((filename, build_report(chunk_rows)))
 
         log_step(f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии", log_placeholder)
+        status_placeholder.info(f"Завершен раздел {section_idx}/{total_sections}")
         progress.progress(section_idx / max(1, total_sections))
 
         if st.session_state.get("stop_requested", False):
@@ -786,8 +801,9 @@ def main() -> None:
     mapping_confirmed: Dict[str, str] = {}
 
     if input_mode == "Ручной ввод URL разделов":
-        text = st.text_area("Введите ссылки на разделы сайта (по одной на строку)", height=220)
-        source_df = make_rows_from_manual_input(text)
+        # Пояснение: поле ручного ввода сделано в одну строку по требованию.
+        one_url = st.text_input("Введите ссылку на раздел сайта")
+        source_df = make_rows_from_manual_input(one_url)
         mapping_confirmed = {"input_url": "input_url"}
     else:
         upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
@@ -835,10 +851,18 @@ def main() -> None:
         ]
 
     section_urls = list(dict.fromkeys(section_urls))
-    st.info(f"Разделов к обработке: {len(section_urls)}")
 
     files_payload: List[Tuple[str, bytes]] = []
     stats = None
+
+    # Пояснение: над полосой прогресса показываем текущий статус обработки.
+    st.subheader("Статус обработки")
+    status_placeholder = st.empty()
+    status_placeholder.info("Ожидание запуска")
+
+    # Пояснение: полоса прогресса размещена над логами по требованию.
+    st.subheader("Прогресс обработки")
+    progress_placeholder = st.empty()
 
     # Пояснение: плейсхолдер логов создаем до запуска, чтобы обновлять логи в реальном времени.
     st.subheader("Логи обработки")
@@ -851,12 +875,14 @@ def main() -> None:
         log_step("Старт обработки", bottom_log_placeholder)
 
         if not section_urls:
+            status_placeholder.error("Нет ссылок разделов для обработки")
             st.warning("Нет ссылок разделов для обработки.")
             return
 
-        files_payload, stats = process_sections(section_urls, bottom_log_placeholder)
+        files_payload, stats = process_sections(section_urls, bottom_log_placeholder, progress_placeholder, status_placeholder)
 
     if stats is not None:
+        status_placeholder.success("Обработка завершена")
         st.success(
             "Готово. "
             f"Карточек найдено: {stats['found_cards']} | "
