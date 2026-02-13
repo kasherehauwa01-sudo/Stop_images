@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
@@ -103,8 +104,17 @@ class HttpClient:
 
 
 def append_log(message: str) -> None:
+    # Пояснение: добавляем timestamp, чтобы в онлайн-логах было понятно, что происходит прямо сейчас.
     st.session_state.setdefault("ui_logs", [])
-    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [message])[-900:]
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {message}"
+    st.session_state["ui_logs"] = (st.session_state["ui_logs"] + [line])[-1200:]
+
+
+def log_step(message: str, placeholder=None) -> None:
+    # Пояснение: единая точка для онлайн-логов — записали строку и сразу отрисовали.
+    append_log(message)
+    render_logs(placeholder)
 
 
 def render_logs(placeholder=None) -> None:
@@ -293,7 +303,7 @@ def scrape_products_from_section(section_url: str, client: HttpClient, max_pages
     base_host = urlparse(first_page["final_url"]).netloc.lower()
 
     append_log(
-        f"Категория: source={first_page['source_url']} -> final={first_page['final_url']} | status={first_page['status_code']}"
+        f"Загружена страница категории: source={first_page['source_url']} -> final={first_page['final_url']} | status={first_page['status_code']}"
     )
 
     queue: List[str] = [first_page["final_url"]]
@@ -319,7 +329,7 @@ def scrape_products_from_section(section_url: str, client: HttpClient, max_pages
             new_count += 1
 
         append_log(
-            f"Страница каталога: {page['final_url']} | карточек={len(products)} | новых={new_count}"
+            f"Парсинг страницы каталога: {page['final_url']} | карточек={len(products)} | новых={new_count}"
         )
 
         # Пояснение: если новых товаров нет, дальнейшая пагинация обычно бессмысленна.
@@ -619,24 +629,21 @@ def process_sections(section_urls: List[str], log_placeholder):
     total_sections = len(section_urls)
 
     for section_idx, section_url in enumerate(section_urls, start=1):
-        append_log(f"Раздел {section_idx}/{total_sections}: {section_url}")
-        render_logs(log_placeholder)
+        log_step(f"Раздел {section_idx}/{total_sections}: {section_url}", log_placeholder)
 
         try:
             products = scrape_products_from_section(section_url, client)
-            append_log(f"Итого уникальных карточек в категории: {len(products)}")
+            log_step(f"Итого уникальных карточек в категории: {len(products)}", log_placeholder)
         except Exception as exc:
             total_errors += 1
-            append_log(f"Ошибка парсинга категории: {exc}")
-            render_logs(log_placeholder)
+            log_step(f"Ошибка парсинга категории: {exc}", log_placeholder)
             progress.progress(section_idx / max(1, total_sections))
             continue
 
         section_rows: List[Dict[str, str]] = []
         for product in products:
             if st.session_state.get("stop_requested", False):
-                append_log("Получена команда СТОП. Останавливаем обработку после текущего шага.")
-                render_logs(log_placeholder)
+                log_step("Получена команда СТОП. Останавливаем обработку после текущего шага.", log_placeholder)
                 break
 
             total_checked += 1
@@ -644,8 +651,7 @@ def process_sections(section_urls: List[str], log_placeholder):
                 item = extract_product_data(product, client)
                 if item["in_stock"] != "1":
                     total_skipped_not_in_stock += 1
-                    append_log(f"Пропущено (нет в наличии): {item['product_url']}")
-                    render_logs(log_placeholder)
+                    log_step(f"Пропущено (нет в наличии): {item['product_url']}", log_placeholder)
                     continue
 
                 total_in_stock += 1
@@ -657,13 +663,13 @@ def process_sections(section_urls: List[str], log_placeholder):
                         "TinEye URL запроса": tineye_url,
                     }
                 )
-                append_log(
-                    f"OK (в наличии): {item['product_url']} | image_source={item['main_image_source']}"
+                log_step(
+                    f"OK (в наличии): {item['product_url']} | image_source={item['main_image_source']}",
+                    log_placeholder,
                 )
             except Exception as exc:
                 total_errors += 1
-                append_log(f"Ошибка карточки {product['product_url']}: {exc}")
-            render_logs(log_placeholder)
+                log_step(f"Ошибка карточки {product['product_url']}: {exc}", log_placeholder)
 
         chunks = split_records(section_rows, REPORT_CHUNK_SIZE)
         category_name = get_second_level_category_name(section_url)
@@ -672,8 +678,7 @@ def process_sections(section_urls: List[str], log_placeholder):
             filename = f"{category_name}{file_suffix}.xlsx"
             all_report_files.append((filename, build_report(chunk_rows)))
 
-        append_log(f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии")
-        render_logs(log_placeholder)
+        log_step(f"Файлов по разделу: {len(chunks)} | учтены только товары в наличии", log_placeholder)
         progress.progress(section_idx / max(1, total_sections))
 
         if st.session_state.get("stop_requested", False):
@@ -764,16 +769,21 @@ def main() -> None:
     files_payload: List[Tuple[str, bytes]] = []
     stats = None
 
+    # Пояснение: плейсхолдер логов создаем до запуска, чтобы обновлять логи в реальном времени.
+    st.subheader("Логи обработки")
+    bottom_log_placeholder = st.empty()
+    render_logs(bottom_log_placeholder)
+
     if run:
         st.session_state["ui_logs"] = []
         st.session_state["stop_requested"] = False
-        append_log("Старт обработки")
+        log_step("Старт обработки", bottom_log_placeholder)
 
         if not section_urls:
             st.warning("Нет ссылок разделов для обработки.")
             return
 
-        files_payload, stats = process_sections(section_urls, None)
+        files_payload, stats = process_sections(section_urls, bottom_log_placeholder)
 
     if stats is not None:
         st.success(
@@ -805,10 +815,6 @@ def main() -> None:
             with st.expander("Список сформированных файлов", expanded=False):
                 for filename, _ in files_payload:
                     st.write(filename)
-
-    st.subheader("Логи обработки")
-    bottom_log_placeholder = st.empty()
-    render_logs(bottom_log_placeholder)
 
 
 if __name__ == "__main__":
