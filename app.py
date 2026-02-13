@@ -545,20 +545,37 @@ def extract_main_image_from_product(soup: BeautifulSoup, product_url: str) -> Tu
     raise ValueError("Не найдено главное изображение товара")
 
 
+def _extract_six_digit_article(text: str) -> str:
+    # Пояснение: извлекаем ровно 6 цифр после маркера "Артикул:".
+    if not text:
+        return ""
+    m = re.search(r"артикул\s*:\s*(\d{6})", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Пояснение: fallback — первая последовательность из 6 цифр в тексте.
+    m2 = re.search(r"\b(\d{6})\b", text)
+    return m2.group(1) if m2 else ""
+
+
 def extract_article(soup: BeautifulSoup) -> str:
     sku_meta = soup.find("meta", attrs={"property": "product:retailer_item_id"}) or soup.find(
         "meta", attrs={"name": "sku"}
     )
     if sku_meta and sku_meta.get("content"):
-        return sku_meta.get("content", "").strip()
+        direct = _extract_six_digit_article(str(sku_meta.get("content", "")))
+        if direct:
+            return direct
 
     for selector in ["[itemprop='sku']", ".sku", "#sku", "[data-sku]", ".product-sku", ".article", "#article"]:
         node = soup.select_one(selector)
         if node:
             val = (node.get("data-sku") or node.get_text(" ", strip=True) or "").strip()
-            if val:
-                return val
-    return ""
+            direct = _extract_six_digit_article(val)
+            if direct:
+                return direct
+
+    # Пояснение: последний fallback — поиск по всему тексту карточки.
+    return _extract_six_digit_article(soup.get_text(" ", strip=True))
 
 
 def _availability_from_json_ld(soup: BeautifulSoup) -> Optional[bool]:
@@ -671,6 +688,7 @@ def process_sections(section_urls: List[str], log_placeholder):
     total_in_stock = 0
     total_skipped_not_in_stock = 0
     total_errors = 0
+    total_found_cards = 0
 
     client = HttpClient()
     progress = st.progress(0.0)
@@ -681,6 +699,7 @@ def process_sections(section_urls: List[str], log_placeholder):
 
         try:
             products = scrape_products_from_section(section_url, client)
+            total_found_cards += len(products)
             log_step(f"Итого уникальных карточек в категории: {len(products)}", log_placeholder)
         except Exception as exc:
             total_errors += 1
@@ -689,11 +708,13 @@ def process_sections(section_urls: List[str], log_placeholder):
             continue
 
         section_rows: List[Dict[str, str]] = []
-        for product in products:
+        card_progress = st.progress(0.0)
+        for card_idx, product in enumerate(products, start=1):
             if st.session_state.get("stop_requested", False):
                 log_step("Получена команда СТОП. Останавливаем обработку после текущего шага.", log_placeholder)
                 break
 
+            log_step(f"Обрабатывается карточка {card_idx} из {len(products)}", log_placeholder)
             total_checked += 1
             try:
                 item = extract_product_data(product, client)
@@ -719,6 +740,8 @@ def process_sections(section_urls: List[str], log_placeholder):
                 total_errors += 1
                 log_step(f"Ошибка карточки {product['product_url']}: {exc}", log_placeholder)
 
+            card_progress.progress(card_idx / max(1, len(products)))
+
         chunks = split_records(section_rows, REPORT_CHUNK_SIZE)
         category_name = get_second_level_category_name(section_url)
         for i, chunk_rows in enumerate(chunks, start=1):
@@ -739,6 +762,7 @@ def process_sections(section_urls: List[str], log_placeholder):
         "skipped_not_in_stock": total_skipped_not_in_stock,
         "errors": total_errors,
         "files": len(all_report_files),
+        "found_cards": total_found_cards,
     }
     return all_report_files, stats
 
@@ -751,7 +775,6 @@ def main() -> None:
         """
 - На вход подается ссылка на раздел сайта (или XLS/XLSX со ссылками разделов).
 - Выполняется парсинг категории с дедупликацией карточек и учетом пагинации.
-- Для карточки ищется главное изображение по приоритетам: og:image → jsonld → gallery → fallback.
 - В отчет попадают только товары в наличии.
         """
     )
@@ -836,6 +859,7 @@ def main() -> None:
     if stats is not None:
         st.success(
             "Готово. "
+            f"Карточек найдено: {stats['found_cards']} | "
             f"Карточек проверено: {stats['checked']} | "
             f"В наличии: {stats['in_stock']} | "
             f"Пропущено (нет в наличии): {stats['skipped_not_in_stock']} | "

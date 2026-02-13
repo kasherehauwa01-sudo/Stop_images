@@ -4,6 +4,7 @@ import io
 from typing import Dict, List
 
 import pandas as pd
+from openpyxl.styles import Font
 
 
 def read_excel(file_obj) -> pd.DataFrame:
@@ -28,4 +29,29 @@ def build_report(records: List[Dict[str, str]]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name="Отчет")
+        ws = writer.book["Отчет"]
+
+        # Пояснение: делаем ссылки активными и задаем анкор "Результат" для TinEye URL.
+        link_font = Font(color="0563C1", underline="single")
+
+        max_site_len = len("Ссылка на сайт")
+        for row_idx in range(2, len(report_df) + 2):
+            site_cell = ws.cell(row=row_idx, column=2)
+            site_url = str(site_cell.value or "").strip()
+            if site_url:
+                site_cell.hyperlink = site_url
+                site_cell.style = "Hyperlink"
+                max_site_len = max(max_site_len, len(site_url))
+
+            tineye_cell = ws.cell(row=row_idx, column=3)
+            tineye_url = str(tineye_cell.value or "").strip()
+            if tineye_url:
+                tineye_cell.hyperlink = tineye_url
+                tineye_cell.value = "Результат"
+                tineye_cell.font = link_font
+
+        # Пояснение: подгоняем ширину колонки "Ссылка на сайт" под самую длинную ссылку.
+        ws.column_dimensions["B"].width = min(max_site_len + 2, 140)
+        ws.column_dimensions["C"].width = max(len("TinEye URL запроса"), len("Результат")) + 4
+
     return output.getvalue()
