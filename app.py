@@ -14,7 +14,7 @@ import streamlit as st
 from bs4 import BeautifulSoup, Tag
 
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
-from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns
+from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns, normalize_text
 
 TIMEOUT_SECONDS = 20
 REPORT_CHUNK_SIZE = 50
@@ -846,27 +846,28 @@ def main() -> None:
         upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
         if upload is not None:
             df_raw = read_excel(upload)
-            st.dataframe(df_raw.head(10), use_container_width=True)
-            auto_mapping, needs_manual = auto_map_columns(df_raw.columns)
-            st.subheader("Сопоставление колонок")
-            if not needs_manual:
-                mapping_confirmed = {k: v for k, v in auto_mapping.items() if v is not None}
-                st.success("Автосопоставление выполнено.")
-            else:
-                st.warning("Автосопоставление неполное: укажите колонку со ссылкой на раздел вручную.")
-                options = [""] + list(df_raw.columns)
-                default = auto_mapping.get("input_url") or ""
-                selected = st.selectbox(
-                    FIELD_LABELS["input_url"],
-                    options=options,
-                    index=options.index(default) if default in options else 0,
-                    key="map_input_url",
-                )
-                if selected:
-                    mapping_confirmed["input_url"] = selected
 
-            if len(mapping_confirmed) == len(REQUIRED_FIELDS_SYNONYMS):
-                source_df = make_rows_from_excel(df_raw, mapping_confirmed)
+            # Пояснение: по требованию после загрузки оставляем только колонку со ссылками.
+            link_col = None
+            for col in df_raw.columns:
+                if normalize_text(str(col)) == normalize_text("Ссылка"):
+                    link_col = col
+                    break
+
+            if link_col is None:
+                auto_mapping, _ = auto_map_columns(df_raw.columns)
+                link_col = auto_mapping.get("input_url")
+
+            if not link_col:
+                st.error("Не найдена колонка 'Ссылка' (или эквивалент с URL).")
+            else:
+                df_links = df_raw[[link_col]].copy()
+                df_links.columns = ["Ссылка"]
+                st.subheader("Данные после очистки (оставлена только колонка 'Ссылка')")
+                st.dataframe(df_links.head(20), use_container_width=True)
+
+                mapping_confirmed = {"input_url": "Ссылка"}
+                source_df = make_rows_from_excel(df_links, mapping_confirmed)
 
     ctrl_col1, ctrl_col2 = st.columns([1, 1])
     with ctrl_col1:
