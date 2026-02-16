@@ -14,6 +14,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup, Tag
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
+from zipfile import BadZipFile
 
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
 
@@ -814,17 +816,31 @@ def _cell_to_link(cell_value: object, hyperlink_target: str = "") -> str:
 
 def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
     # Пояснение: берем ссылки строго из первой колонки, как требуется.
+    # Для .xlsx читаем через openpyxl (с поддержкой hyperlink.target),
+    # для .xls и не-zip форматов делаем безопасный fallback через pandas.
     raw = uploaded_file.getvalue()
-    wb = load_workbook(filename=BytesIO(raw), data_only=False, read_only=True)
-    ws = wb.active
-
     links: List[str] = []
-    for row in ws.iter_rows(min_row=2, min_col=1, max_col=1):
-        cell = row[0]
-        hyperlink_target = cell.hyperlink.target if cell.hyperlink else ""
-        link = _cell_to_link(cell.value, hyperlink_target)
-        if link:
-            links.append(link)
+
+    try:
+        wb = load_workbook(filename=BytesIO(raw), data_only=False, read_only=True)
+        ws = wb.active
+
+        for row in ws.iter_rows(min_row=2, min_col=1, max_col=1):
+            cell = row[0]
+            hyperlink_target = cell.hyperlink.target if cell.hyperlink else ""
+            link = _cell_to_link(cell.value, hyperlink_target)
+            if link:
+                links.append(link)
+    except (BadZipFile, InvalidFileException, KeyError, ValueError):
+        # Пояснение: fallback для .xls и поврежденных/нестандартных excel-файлов.
+        df = read_excel(BytesIO(raw))
+        if df.shape[1] == 0:
+            return []
+
+        for value in df.iloc[:, 0].tolist():
+            link = _cell_to_link(value, "")
+            if link:
+                links.append(link)
 
     # Пояснение: сохраняем порядок и убираем повторы пустых/дублирующих ссылок.
     uniq: List[str] = []
@@ -889,7 +905,12 @@ def main() -> None:
             upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
             if upload is not None:
                 # Пояснение: ссылки читаем строго из первой колонки, включая Excel-гиперссылки.
-                links = read_first_column_links_from_xlsx(upload)
+                try:
+                    links = read_first_column_links_from_xlsx(upload)
+                except Exception as exc:
+                    st.error(f"Не удалось прочитать файл: {exc}")
+                    links = []
+
                 if not links:
                     st.error("В первой колонке не найдены ссылки.")
                 else:
@@ -989,7 +1010,12 @@ def main() -> None:
         st.caption("Загрузите XLS/XLSX: ссылки берутся из первой колонки.")
         check_upload = st.file_uploader("Файл для проверки XLS", type=["xls", "xlsx"], key="check_xls_upload")
         if check_upload is not None:
-            check_links = read_first_column_links_from_xlsx(check_upload)
+            try:
+                check_links = read_first_column_links_from_xlsx(check_upload)
+            except Exception as exc:
+                st.error(f"Не удалось прочитать файл: {exc}")
+                check_links = []
+
             if not check_links:
                 st.error("В первой колонке файла для проверки не найдено ссылок.")
             else:
