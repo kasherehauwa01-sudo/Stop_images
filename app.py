@@ -11,10 +11,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup, Tag
+from openpyxl import load_workbook
 
 from excel_io import build_report, make_rows_from_excel, make_rows_from_manual_input, read_excel
-from mapping import FIELD_LABELS, REQUIRED_FIELDS_SYNONYMS, auto_map_columns, normalize_text
 
 TIMEOUT_SECONDS = 20
 REPORT_CHUNK_SIZE = 50
@@ -795,6 +796,45 @@ def build_zip_filename(section_urls: List[str]) -> str:
         return f"{get_second_level_category_name(section_urls[0])}_multi.zip"
     return "report.zip"
 
+
+def _cell_to_link(cell_value: object, hyperlink_target: str = "") -> str:
+    # Пояснение: нормализуем ссылку из ячейки; поддерживаем обычные URL и гиперссылки Excel.
+    if hyperlink_target:
+        return str(hyperlink_target).strip()
+    if cell_value is None:
+        return ""
+
+    text = str(cell_value).strip()
+    if text.startswith("HYPERLINK("):
+        m = re.search(r'"(https?://[^"]+)"', text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return text
+
+
+def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
+    # Пояснение: берем ссылки строго из первой колонки, как требуется.
+    raw = uploaded_file.getvalue()
+    wb = load_workbook(filename=BytesIO(raw), data_only=False, read_only=True)
+    ws = wb.active
+
+    links: List[str] = []
+    for row in ws.iter_rows(min_row=2, min_col=1, max_col=1):
+        cell = row[0]
+        hyperlink_target = cell.hyperlink.target if cell.hyperlink else ""
+        link = _cell_to_link(cell.value, hyperlink_target)
+        if link:
+            links.append(link)
+
+    # Пояснение: сохраняем порядок и убираем повторы пустых/дублирующих ссылок.
+    uniq: List[str] = []
+    seen = set()
+    for lnk in links:
+        if lnk not in seen:
+            seen.add(lnk)
+            uniq.append(lnk)
+    return uniq
+
 def main() -> None:
     st.set_page_config(page_title="TinEye URL-отчеты по товарам", layout="wide")
     st.title("Генерация TinEye URL по товарам в наличии")
@@ -833,124 +873,138 @@ def main() -> None:
 
     st.session_state.setdefault("stop_requested", False)
 
-    input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
-    source_df = None
-    mapping_confirmed: Dict[str, str] = {}
+    tab_main, tab_check = st.tabs(["Основная проверка", "Проверка XLS"])
 
-    if input_mode == "Ручной ввод URL разделов":
-        # Пояснение: поле ручного ввода сделано в одну строку по требованию.
-        one_url = st.text_input("Введите ссылку на раздел сайта")
-        source_df = make_rows_from_manual_input(one_url)
-        mapping_confirmed = {"input_url": "input_url"}
-    else:
-        upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
-        if upload is not None:
-            df_raw = read_excel(upload)
+    with tab_main:
+        input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
+        source_df = None
+        mapping_confirmed: Dict[str, str] = {}
 
-            # Пояснение: по требованию после загрузки оставляем только колонку со ссылками.
-            link_col = None
-            for col in df_raw.columns:
-                if normalize_text(str(col)) == normalize_text("Ссылка"):
-                    link_col = col
-                    break
-
-            if link_col is None:
-                auto_mapping, _ = auto_map_columns(df_raw.columns)
-                link_col = auto_mapping.get("input_url")
-
-            if not link_col:
-                st.error("Не найдена колонка 'Ссылка' (или эквивалент с URL).")
-            else:
-                df_links = df_raw[[link_col]].copy()
-                df_links.columns = ["Ссылка"]
-                st.subheader("Данные после очистки (оставлена только колонка 'Ссылка')")
-                st.dataframe(df_links.head(20), use_container_width=True)
-
-                mapping_confirmed = {"input_url": "Ссылка"}
-                source_df = make_rows_from_excel(df_links, mapping_confirmed)
-
-    ctrl_col1, ctrl_col2 = st.columns([1, 1])
-    with ctrl_col1:
-        run = st.button("Сформировать отчеты", type="primary")
-    with ctrl_col2:
-        stop_clicked = st.button("Стоп", type="secondary")
-        if stop_clicked:
-            st.session_state["stop_requested"] = True
-
-    if st.session_state.get("stop_requested", False):
-        st.warning("Запрошена остановка обработки. Для нового запуска нажмите «Сформировать отчеты».")
-
-    section_urls: List[str] = []
-    if source_df is not None:
-        section_urls = [
-            str(r.get("input_url", "")).strip()
-            for r in source_df.fillna("").to_dict(orient="records")
-            if str(r.get("input_url", "")).strip()
-        ]
-
-    section_urls = list(dict.fromkeys(section_urls))
-
-    files_payload: List[Tuple[str, bytes]] = []
-    stats = None
-
-    # Пояснение: над полосой прогресса показываем текущий статус обработки.
-    st.subheader("Статус обработки")
-    status_placeholder = st.empty()
-    status_placeholder.info("Ожидание запуска")
-
-    # Пояснение: полоса прогресса размещена над логами по требованию.
-    st.subheader("Прогресс обработки")
-    progress_placeholder = st.empty()
-
-    # Пояснение: плейсхолдер логов создаем до запуска, чтобы обновлять логи в реальном времени.
-    with st.expander("Логи обработки", expanded=False):
-        bottom_log_placeholder = st.empty()
-        render_logs(bottom_log_placeholder)
-
-    if run:
-        st.session_state["ui_logs"] = []
-        st.session_state["stop_requested"] = False
-        log_step("Старт обработки", bottom_log_placeholder)
-
-        if not section_urls:
-            status_placeholder.error("Нет ссылок разделов для обработки")
-            st.warning("Нет ссылок разделов для обработки.")
-            return
-
-        files_payload, stats = process_sections(section_urls, bottom_log_placeholder, progress_placeholder, status_placeholder)
-
-    if stats is not None:
-        status_placeholder.success("Обработка завершена")
-        st.success(
-            "Готово. "
-            f"Карточек найдено: {stats['found_cards']} | "
-            f"Карточек проверено: {stats['checked']} | "
-            f"В наличии: {stats['in_stock']} | "
-            f"Пропущено (нет в наличии): {stats['skipped_not_in_stock']} | "
-            f"Ошибок: {stats['errors']} | Файлов XLSX: {stats['files']}"
-        )
-
-        if not files_payload:
-            st.info("Нет данных для формирования отчетов.")
-        elif len(files_payload) == 1:
-            filename, payload = files_payload[0]
-            st.download_button(
-                label=f"Скачать {filename}",
-                data=payload,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+        if input_mode == "Ручной ввод URL разделов":
+            # Пояснение: поле ручного ввода сделано в одну строку по требованию.
+            one_url = st.text_input("Введите ссылку на раздел сайта")
+            source_df = make_rows_from_manual_input(one_url)
+            mapping_confirmed = {"input_url": "input_url"}
         else:
-            zip_payload = build_zip_with_reports(files_payload)
-            st.download_button(
-                label="Скачать все отчеты ZIP",
-                data=zip_payload,
-                file_name=build_zip_filename(section_urls),
-                mime="application/zip",
+            upload = st.file_uploader("Загрузите XLS/XLSX", type=["xls", "xlsx"])
+            if upload is not None:
+                # Пояснение: ссылки читаем строго из первой колонки, включая Excel-гиперссылки.
+                links = read_first_column_links_from_xlsx(upload)
+                if not links:
+                    st.error("В первой колонке не найдены ссылки.")
+                else:
+                    preview_df = read_excel(upload).iloc[:, :1].copy()
+                    preview_df.columns = ["Ссылка"]
+                    st.subheader("Данные после очистки (оставлена только первая колонка 'Ссылка')")
+                    st.dataframe(preview_df.head(20), use_container_width=True)
+
+                    source_df = make_rows_from_manual_input("\n".join(links))
+                    mapping_confirmed = {"input_url": "input_url"}
+
+        ctrl_col1, ctrl_col2 = st.columns([1, 1])
+        with ctrl_col1:
+            run = st.button("Сформировать отчеты", type="primary")
+        with ctrl_col2:
+            stop_clicked = st.button("Стоп", type="secondary")
+            if stop_clicked:
+                st.session_state["stop_requested"] = True
+
+        if st.session_state.get("stop_requested", False):
+            st.warning("Запрошена остановка обработки. Для нового запуска нажмите «Сформировать отчеты».")
+
+        section_urls: List[str] = []
+        if source_df is not None:
+            section_urls = [
+                str(r.get("input_url", "")).strip()
+                for r in source_df.fillna("").to_dict(orient="records")
+                if str(r.get("input_url", "")).strip()
+            ]
+
+        section_urls = list(dict.fromkeys(section_urls))
+
+        files_payload: List[Tuple[str, bytes]] = []
+        stats = None
+
+        # Пояснение: над полосой прогресса показываем текущий статус обработки.
+        st.subheader("Статус обработки")
+        status_placeholder = st.empty()
+        status_placeholder.info("Ожидание запуска")
+
+        # Пояснение: полоса прогресса размещена над логами по требованию.
+        st.subheader("Прогресс обработки")
+        progress_placeholder = st.empty()
+
+        # Пояснение: плейсхолдер логов создаем до запуска, чтобы обновлять логи в реальном времени.
+        with st.expander("Логи обработки", expanded=False):
+            bottom_log_placeholder = st.empty()
+            render_logs(bottom_log_placeholder)
+
+        if run:
+            st.session_state["ui_logs"] = []
+            st.session_state["stop_requested"] = False
+            log_step("Старт обработки", bottom_log_placeholder)
+
+            if not section_urls:
+                status_placeholder.error("Нет ссылок разделов для обработки")
+                st.warning("Нет ссылок разделов для обработки.")
+                return
+
+            files_payload, stats = process_sections(section_urls, bottom_log_placeholder, progress_placeholder, status_placeholder)
+
+        if stats is not None:
+            status_placeholder.success("Обработка завершена")
+            st.success(
+                "Готово. "
+                f"Карточек найдено: {stats['found_cards']} | "
+                f"Карточек проверено: {stats['checked']} | "
+                f"В наличии: {stats['in_stock']} | "
+                f"Пропущено (нет в наличии): {stats['skipped_not_in_stock']} | "
+                f"Ошибок: {stats['errors']} | Файлов XLSX: {stats['files']}"
             )
-            with st.expander("Список сформированных файлов", expanded=False):
-                for filename, _ in files_payload:
-                    st.write(filename)
+
+            if not files_payload:
+                st.info("Нет данных для формирования отчетов.")
+            elif len(files_payload) == 1:
+                filename, payload = files_payload[0]
+                st.download_button(
+                    label=f"Скачать {filename}",
+                    data=payload,
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                zip_payload = build_zip_with_reports(files_payload)
+                st.download_button(
+                    label="Скачать все отчеты ZIP",
+                    data=zip_payload,
+                    file_name=build_zip_filename(section_urls),
+                    mime="application/zip",
+                )
+                with st.expander("Список сформированных файлов", expanded=False):
+                    for filename, _ in files_payload:
+                        st.write(filename)
+
+    with tab_check:
+        st.subheader("Проверка XLS")
+        st.caption("Загрузите XLS/XLSX: ссылки берутся из первой колонки.")
+        check_upload = st.file_uploader("Файл для проверки XLS", type=["xls", "xlsx"], key="check_xls_upload")
+        if check_upload is not None:
+            check_links = read_first_column_links_from_xlsx(check_upload)
+            if not check_links:
+                st.error("В первой колонке файла для проверки не найдено ссылок.")
+            else:
+                st.info(f"Найдено ссылок в первой колонке: {len(check_links)}")
+                st.dataframe({"Ссылка": check_links[:200]}, use_container_width=True)
+
+                # Пояснение: открытие ссылок в новых вкладках можно инициировать по нажатию кнопки.
+                if st.button("Открыть все ссылки в новых вкладках", key="open_all_check_links"):
+                    links_js = "\n".join([f"window.open({json.dumps(link)}, '_blank');" for link in check_links])
+                    components.html(f"<script>{links_js}</script>", height=0)
+
+                st.warning(
+                    "Автоматически проходить anti-bot/captcha (ставить галочку 'Я не робот') сервис не может. "
+                    "Эту проверку нужно подтверждать вручную в открытых вкладках."
+                )
 
 
 if __name__ == "__main__":
