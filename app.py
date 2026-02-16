@@ -820,13 +820,29 @@ def _cell_to_link(cell_value: object, hyperlink_target: str = "") -> str:
     return text
 
 
+def _extract_urls_from_binary(raw: bytes) -> List[str]:
+    # Пояснение: резервный способ для нестандартных/битых xls — вытаскиваем URL напрямую из бинарных данных.
+    text = raw.decode("latin-1", errors="ignore")
+    found = re.findall(r"https?://[^\s\"'<>]+", text, flags=re.IGNORECASE)
+
+    uniq: List[str] = []
+    seen = set()
+    for url in found:
+        clean = url.strip().rstrip('.,;')
+        if clean and clean not in seen:
+            seen.add(clean)
+            uniq.append(clean)
+    return uniq
+
+
 def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
     # Пояснение: берем ссылки строго из первой колонки, как требуется.
     # Для .xlsx читаем через openpyxl (с поддержкой hyperlink.target),
-    # для .xls и не-zip форматов делаем безопасный fallback через pandas.
+    # для .xls и не-zip форматов делаем fallback через pandas/xlrd.
     raw = uploaded_file.getvalue()
     links: List[str] = []
 
+    # 1) Основной путь: openpyxl для нормальных xlsx
     try:
         wb = load_workbook(filename=BytesIO(raw), data_only=False, read_only=True)
         ws = wb.active
@@ -838,15 +854,23 @@ def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
             if link:
                 links.append(link)
     except (BadZipFile, InvalidFileException, KeyError, ValueError):
-        # Пояснение: fallback для .xls и поврежденных/нестандартных excel-файлов.
-        df = read_excel(BytesIO(raw))
-        if df.shape[1] == 0:
-            return []
+        df = None
+        # 2) fallback: пробуем pandas с авто-движком
+        try:
+            df = read_excel(BytesIO(raw))
+        except Exception:
+            # 3) fallback для старых xls: pandas + xlrd
+            try:
+                df = read_excel(BytesIO(raw), engine="xlrd")
+            except Exception:
+                # 4) последний резерв: вытащить URL регуляркой из бинарного содержимого
+                links = _extract_urls_from_binary(raw)
 
-        for value in df.iloc[:, 0].tolist():
-            link = _cell_to_link(value, "")
-            if link:
-                links.append(link)
+        if df is not None and len(links) == 0 and df.shape[1] > 0:
+            for value in df.iloc[:, 0].tolist():
+                link = _cell_to_link(value, "")
+                if link:
+                    links.append(link)
 
     # Пояснение: сохраняем порядок и убираем повторы пустых/дублирующих ссылок.
     uniq: List[str] = []
