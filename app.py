@@ -800,7 +800,7 @@ def build_zip_filename(section_urls: List[str]) -> str:
 
 
 def _cell_to_link(cell_value: object, hyperlink_target: str = "") -> str:
-    # Пояснение: нормализуем ссылку из ячейки; поддерживаем обычные URL и гиперссылки Excel.
+    # Пояснение: нормализуем ссылку из ячейки; поддерживаем обычные URL, Excel-гиперссылки и HTML-анкор.
     if hyperlink_target:
         return str(hyperlink_target).strip()
     if cell_value is None:
@@ -811,6 +811,12 @@ def _cell_to_link(cell_value: object, hyperlink_target: str = "") -> str:
         m = re.search(r'"(https?://[^"]+)"', text, flags=re.IGNORECASE)
         if m:
             return m.group(1).strip()
+
+    # Пояснение: если в ячейке лежит HTML-анкор, извлекаем href.
+    m_anchor = re.search(r'href\s*=\s*["\'](https?://[^"\']+)["\']', text, flags=re.IGNORECASE)
+    if m_anchor:
+        return m_anchor.group(1).strip()
+
     return text
 
 
@@ -850,6 +856,48 @@ def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
             seen.add(lnk)
             uniq.append(lnk)
     return uniq
+
+
+def process_first_column_links(links: List[str], status_placeholder, progress_placeholder, log_placeholder):
+    # Пояснение: для загрузки XLS формируем TinEye URL напрямую из ссылок первой колонки.
+    status_placeholder.info("Формирование TinEye URL из первой колонки XLS")
+    progress = progress_placeholder.progress(0.0)
+
+    rows: List[Dict[str, str]] = []
+    for idx, link in enumerate(links, start=1):
+        if st.session_state.get("stop_requested", False):
+            log_step("Получена команда СТОП. Прерываем обработку XLS-ссылок.", log_placeholder)
+            break
+
+        status_placeholder.info(f"Обрабатывается ссылка {idx} из {len(links)}")
+        log_step(f"XLS: ссылка {idx}/{len(links)} -> формирование TinEye URL", log_placeholder)
+
+        rows.append(
+            {
+                "Артикул": "",
+                "Ссылка на сайт": link,
+                "TinEye URL запроса": build_tineye_search_url(link),
+            }
+        )
+        progress.progress(idx / max(1, len(links)))
+
+    chunks = split_records(rows, REPORT_CHUNK_SIZE)
+    files_payload: List[Tuple[str, bytes]] = []
+    for i, chunk_rows in enumerate(chunks, start=1):
+        suffix = f"_{i}" if len(chunks) > 1 else ""
+        files_payload.append((f"xls_links{suffix}.xlsx", build_report(chunk_rows)))
+
+    stats = {
+        "sections": 0,
+        "checked": len(rows),
+        "in_stock": 0,
+        "skipped_not_in_stock": 0,
+        "errors": 0,
+        "files": len(files_payload),
+        "found_cards": len(rows),
+    }
+    status_placeholder.success("Обработка XLS завершена")
+    return files_payload, stats
 
 def main() -> None:
     st.set_page_config(page_title="TinEye URL-отчеты по товарам", layout="wide")
@@ -895,6 +943,7 @@ def main() -> None:
         input_mode = st.radio("Способ ввода", ["Ручной ввод URL разделов", "Загрузка XLS"], horizontal=True)
         source_df = None
         mapping_confirmed: Dict[str, str] = {}
+        xls_first_col_links: List[str] = []
 
         if input_mode == "Ручной ввод URL разделов":
             # Пояснение: поле ручного ввода сделано в одну строку по требованию.
@@ -919,6 +968,7 @@ def main() -> None:
                     st.subheader("Данные после очистки (оставлена только первая колонка 'Ссылка')")
                     st.dataframe(preview_df.head(20), use_container_width=True)
 
+                    xls_first_col_links = links
                     source_df = make_rows_from_manual_input("\n".join(links))
                     mapping_confirmed = {"input_url": "input_url"}
 
@@ -965,12 +1015,24 @@ def main() -> None:
             st.session_state["stop_requested"] = False
             log_step("Старт обработки", bottom_log_placeholder)
 
-            if not section_urls:
-                status_placeholder.error("Нет ссылок разделов для обработки")
-                st.warning("Нет ссылок разделов для обработки.")
-                return
+            if input_mode == "Загрузка XLS":
+                if not xls_first_col_links:
+                    status_placeholder.error("В XLS не найдено ссылок в первой колонке")
+                    st.warning("В XLS не найдено ссылок в первой колонке.")
+                    return
+                files_payload, stats = process_first_column_links(
+                    xls_first_col_links,
+                    status_placeholder,
+                    progress_placeholder,
+                    bottom_log_placeholder,
+                )
+            else:
+                if not section_urls:
+                    status_placeholder.error("Нет ссылок разделов для обработки")
+                    st.warning("Нет ссылок разделов для обработки.")
+                    return
 
-            files_payload, stats = process_sections(section_urls, bottom_log_placeholder, progress_placeholder, status_placeholder)
+                files_payload, stats = process_sections(section_urls, bottom_log_placeholder, progress_placeholder, status_placeholder)
 
         if stats is not None:
             status_placeholder.success("Обработка завершена")
