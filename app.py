@@ -142,7 +142,9 @@ def render_logs(placeholder=None) -> None:
 
 
 def build_tineye_search_url(image_url: str, base_url: str = "https://tineye.com") -> str:
-    return f"{base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
+    # Пояснение: формируем URL в прежнем формате без дополнительного кодирования,
+    # чтобы не получать двойное экранирование уже валидных ссылок.
+    return f"{base_url.rstrip('/')}/search?url={image_url}"
 
 
 def normalize_product_url(url: str) -> str:

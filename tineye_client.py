@@ -4,7 +4,7 @@ import html as ihtml
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlencode
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -77,7 +77,8 @@ class TinEyeScraperClient:
         return any(marker in lowered for marker in markers)
 
     def build_search_url(self, image_url: str) -> str:
-        return f"{self.settings.base_url.rstrip('/')}/search?" + urlencode({"url": image_url})
+        # Пояснение: возвращаем прежний формат TinEye URL без urlencode для всего значения.
+        return f"{self.settings.base_url.rstrip('/')}/search?url={image_url}"
 
     def search_by_url(self, image_url: str, top_n: int = 20) -> List[Dict[str, str]]:
         # Пояснение: передаем URL изображения в поле Search by image url.
