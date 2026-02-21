@@ -837,19 +837,21 @@ def _extract_urls_from_binary(raw: bytes) -> List[str]:
     return uniq
 
 
-def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
-    # Пояснение: берем ссылки строго из первой колонки, как требуется.
+def read_links_from_xlsx_column(uploaded_file, column_index: int = 0) -> List[str]:
+    # Пояснение: читаем ссылки из выбранной колонки (0-based), чтобы поддержать сопоставление колонок в интерфейсе.
     # Для .xlsx читаем через openpyxl (с поддержкой hyperlink.target),
     # для .xls и не-zip форматов делаем fallback через pandas/xlrd.
     raw = uploaded_file.getvalue()
     links: List[str] = []
+
+    target_col = max(0, int(column_index)) + 1
 
     # 1) Основной путь: openpyxl для нормальных xlsx
     try:
         wb = load_workbook(filename=BytesIO(raw), data_only=False, read_only=True)
         ws = wb.active
 
-        for row in ws.iter_rows(min_row=2, min_col=1, max_col=1):
+        for row in ws.iter_rows(min_row=2, min_col=target_col, max_col=target_col):
             cell = row[0]
             hyperlink_target = cell.hyperlink.target if cell.hyperlink else ""
             link = _cell_to_link(cell.value, hyperlink_target)
@@ -868,8 +870,8 @@ def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
                 # 4) последний резерв: вытащить URL регуляркой из бинарного содержимого
                 links = _extract_urls_from_binary(raw)
 
-        if df is not None and len(links) == 0 and df.shape[1] > 0:
-            for value in df.iloc[:, 0].tolist():
+        if df is not None and len(links) == 0 and df.shape[1] > column_index:
+            for value in df.iloc[:, column_index].tolist():
                 link = _cell_to_link(value, "")
                 if link:
                     links.append(link)
@@ -882,6 +884,11 @@ def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
             seen.add(lnk)
             uniq.append(lnk)
     return uniq
+
+
+def read_first_column_links_from_xlsx(uploaded_file) -> List[str]:
+    # Пояснение: совместимость со старым кодом — первая колонка теперь просто частный случай.
+    return read_links_from_xlsx_column(uploaded_file, column_index=0)
 
 
 def process_first_column_links(links: List[str], status_placeholder, progress_placeholder, log_placeholder):
@@ -1095,30 +1102,74 @@ def main() -> None:
 
     with tab_check:
         st.subheader("Проверка XLS")
-        st.caption("Загрузите XLS/XLSX: ссылки берутся из первой колонки.")
+        st.caption("Загрузите XLS/XLSX и сопоставьте колонки, чтобы выбрать источник ссылок.")
         check_upload = st.file_uploader("Файл для проверки XLS", type=["xls", "xlsx"], key="check_xls_upload")
         if check_upload is not None:
+            raw = check_upload.getvalue()
             try:
-                check_links = read_first_column_links_from_xlsx(check_upload)
-            except Exception as exc:
-                st.error(f"Не удалось прочитать файл: {exc}")
-                check_links = []
+                # Пояснение: для интерфейса сопоставления читаем табличный превью-набор колонок.
+                check_df = read_excel(BytesIO(raw))
+            except Exception:
+                try:
+                    check_df = read_excel(BytesIO(raw), engine="xlrd")
+                except Exception as exc:
+                    st.error(f"Не удалось прочитать файл: {exc}")
+                    check_df = None
 
-            if not check_links:
-                st.error("В первой колонке файла для проверки не найдено ссылок.")
-            else:
-                st.info(f"Найдено ссылок в первой колонке: {len(check_links)}")
-                st.dataframe({"Ссылка": check_links[:200]}, use_container_width=True)
+            if check_df is not None:
+                if check_df.shape[1] == 0:
+                    st.error("В файле нет колонок для сопоставления.")
+                else:
+                    # Пояснение: формируем удобные подписи колонок вида "1: Название".
+                    col_options = []
+                    for idx, col_name in enumerate(check_df.columns.tolist()):
+                        shown_name = str(col_name).strip() or f"Колонка {idx + 1}"
+                        col_options.append((idx, f"{idx + 1}: {shown_name}"))
 
-                # Пояснение: открытие ссылок в новых вкладках можно инициировать по нажатию кнопки.
-                if st.button("Открыть все ссылки в новых вкладках", key="open_all_check_links"):
-                    links_js = "\n".join([f"window.open({json.dumps(link)}, '_blank');" for link in check_links])
-                    components.html(f"<script>{links_js}</script>", height=0)
+                    st.markdown("**Сопоставление колонок**")
+                    selected_link_col = st.selectbox(
+                        "Колонка с ссылкой на сайт",
+                        options=col_options,
+                        format_func=lambda item: item[1],
+                        key="check_link_col_select",
+                    )
 
-                st.warning(
-                    "Автоматически проходить anti-bot/captcha (ставить галочку 'Я не робот') сервис не может. "
-                    "Эту проверку нужно подтверждать вручную в открытых вкладках."
-                )
+                    selected_article_col = st.selectbox(
+                        "Колонка с артикулом (опционально)",
+                        options=[(-1, "Не использовать артикул")] + col_options,
+                        format_func=lambda item: item[1],
+                        key="check_article_col_select",
+                    )
+
+                    try:
+                        check_links = read_links_from_xlsx_column(check_upload, selected_link_col[0])
+                    except Exception as exc:
+                        st.error(f"Не удалось извлечь ссылки из выбранной колонки: {exc}")
+                        check_links = []
+
+                    preview_map: Dict[str, List[str]] = {
+                        "Ссылка": [str(v).strip() for v in check_df.iloc[:, selected_link_col[0]].fillna("").head(200).tolist()]
+                    }
+                    if selected_article_col[0] >= 0:
+                        preview_map["Артикул"] = [
+                            str(v).strip() for v in check_df.iloc[:, selected_article_col[0]].fillna("").head(200).tolist()
+                        ]
+
+                    if not check_links:
+                        st.error("В выбранной колонке не найдено ссылок.")
+                    else:
+                        st.info(f"Найдено ссылок в выбранной колонке: {len(check_links)}")
+                        st.dataframe(preview_map, use_container_width=True)
+
+                        # Пояснение: открытие ссылок в новых вкладках можно инициировать по нажатию кнопки.
+                        if st.button("Открыть все ссылки в новых вкладках", key="open_all_check_links"):
+                            links_js = "\n".join([f"window.open({json.dumps(link)}, '_blank');" for link in check_links])
+                            components.html(f"<script>{links_js}</script>", height=0)
+
+                        st.warning(
+                            "Автоматически проходить anti-bot/captcha (ставить галочку 'Я не робот') сервис не может. "
+                            "Эту проверку нужно подтверждать вручную в открытых вкладках."
+                        )
 
 
 if __name__ == "__main__":
